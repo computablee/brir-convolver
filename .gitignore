@@ -1,0 +1,23 @@
+# Build output (recreate with BRIRConvolver/build.sh)
+build/
+*.app
+*.iconset
+build.log
+
+# Local build-watcher trigger
+.rebuild
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# Editors / Xcode, if ever opened there
+.vscode/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.swiftpm/
