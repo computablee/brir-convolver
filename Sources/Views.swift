@@ -77,11 +77,29 @@ struct MainView: View {
                     Text(state.running && state.bypass ? "\(state.status) (bypassed)" : state.status)
                     Spacer()
                     if state.running {
-                        Text("DSP load \(state.meters.cpu * 100, specifier: "%.1f")%")
-                            .monospacedDigit().foregroundStyle(.secondary)
+                        HStack(spacing: 14) {
+                            Text("Added delay \(state.meters.addedDelayMs, specifier: "%.1f") ms")
+                                .help("Latency this app adds between an app's audio and the output device: "
+                                      + "Core Audio capture→output plus the convolver partition. See the breakdown below.")
+                            Text("DSP \(state.meters.computeAvgMs, specifier: "%.3f") ms (peak \(state.meters.computeMaxMs, specifier: "%.3f"))")
+                                .help(String(format: "Time spent computing each audio callback of %d frames: average %.3f ms, recent worst %.3f ms, deadline %.2f ms.",
+                                             state.meters.callbackFrames, state.meters.computeAvgMs, state.meters.computeMaxMs, state.meters.budgetMs))
+                            Text("Load \(state.meters.cpu * 100, specifier: "%.1f")%")
+                                .help("Average compute time as a share of the time available per callback. Dropouts start near 100%.")
+                        }
+                        .monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
                 if !state.detail.isEmpty { Text(state.detail).font(.caption).foregroundStyle(.secondary) }
+                if state.running {
+                    let m = state.meters
+                    Text(String(format: "Delay: I/O %.1f ms + partition %.1f ms = %.1f ms added · output device reports %.1f ms",
+                                m.ioMs, m.partitionMs, m.addedDelayMs, m.downstreamMs))
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %d-frame callback, against a %.2f ms deadline (%.0f× headroom at peak).",
+                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0))
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
                 if let e = state.lastError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
                 if state.running {
                     MeterRow(label: "In", l: state.meters.inL, r: state.meters.inR)

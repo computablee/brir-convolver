@@ -38,11 +38,24 @@ final class AppState: ObservableObject {
     @Published private(set) var analysis: IRAnalysis?
     @Published private(set) var analyzing = false
     @Published private(set) var analysisID = 0
+    /// Length of the longest FIR path currently loaded in the convolver, at the processing rate.
+    @Published private(set) var firTaps = 0
+    @Published private(set) var firRate = 0.0
 
     struct Meters: Equatable {
         var inL = -120.0, inR = -120.0, outL = -120.0, outR = -120.0
         var clips = 0
         var cpu = 0.0
+        var addedDelayMs = 0.0      // what this app adds: Core Audio capture→output + convolver partition
+        var ioMs = 0.0
+        var ioMeasured = false
+        var expectedIOMs = 0.0
+        var partitionMs = 0.0
+        var downstreamMs = 0.0
+        var computeAvgMs = 0.0      // DSP time per audio callback (average)
+        var computeMaxMs = 0.0      // worst callback, decaying peak hold
+        var budgetMs = 0.0          // time available per callback (callback frames / sample rate)
+        var callbackFrames = 0      // output device's self-reported latency (not added by this app)
     }
 
     private var sourceIR: TrueStereoIR?
@@ -230,6 +243,8 @@ final class AppState: ObservableObject {
             let conv = StereoConvolver(ir: ir, blockSize: blockSize, gainDB: preampDB, bypass: bypass, limiter: limiter)
             try p.start(convolver: conv)
             pipeline = p
+            firTaps = ir.length
+            firRate = rate
             currentExclusions = excl.ids
             excludedNames = excl.names
             observedDevice = dev
@@ -284,6 +299,24 @@ final class AppState: ObservableObject {
         P[K.peakInL] = 0; P[K.peakInR] = 0; P[K.peakOutL] = 0; P[K.peakOutR] = 0
         m.clips = Int(P[K.clips])
         m.cpu = p.cpuLoad
+        // Delay this app adds, from Core Audio timestamps (output sample time − tap input sample time
+        // inside one IOProc cycle) plus the convolver's partition. The output device's own reported latency
+        // is downstream of us and exists with or without this app, so it is reported separately.
+        let sr = c.sampleRate
+        let expected = Double(p.ioBufferFrames + p.aggregateOverheadFrames)
+        m.ioMeasured = p.measuredIOFrames > 0
+        let io = m.ioMeasured ? p.measuredIOFrames : expected
+        m.ioMs = io / sr * 1000
+        m.expectedIOMs = expected / sr * 1000
+        m.partitionMs = Double(c.latencyFrames) / sr * 1000
+        m.addedDelayMs = m.ioMs + m.partitionMs
+        m.downstreamMs = Double(p.outputLatencyFrames) / sr * 1000
+        m.computeAvgMs = p.computeAvg * 1000
+        // Peak hold for ~2 s so short spikes stay readable
+        let newMax = p.takeComputeMax() * 1000
+        m.computeMaxMs = max(newMax, meters.computeMaxMs * 0.97)
+        m.budgetMs = p.computeBudget * 1000
+        m.callbackFrames = p.lastFrames
         if m != meters { meters = m }
     }
 

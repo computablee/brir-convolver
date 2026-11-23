@@ -26,6 +26,21 @@ final class AudioPipeline {
     var convolver: StereoConvolver? { context?.convolver }
     var cpuLoad: Double { context?.cpuLoad ?? 0 }
     var callbacks: UInt64 { context?.callbacks ?? 0 }
+    /// Frames between the tap's input time and the output time inside our IOProc (measured from HAL timestamps).
+    var measuredIOFrames: Double { context?.ioFrames ?? 0 }
+    /// Compute time per IOProc callback (seconds): smoothed average, worst since last reset, and the deadline.
+    var computeAvg: Double { context?.computeAvg ?? 0 }
+    var computeBudget: Double { context?.computeBudget ?? 0 }
+    var lastFrames: Int { context?.lastFrames ?? 0 }
+    func takeComputeMax() -> Double {
+        guard let c = context else { return 0 }
+        let v = c.computeMax; c.computeMax = 0; return v
+    }
+    /// Output device's own presentation latency (device + stream latency), in frames.
+    private(set) var outputLatencyFrames: Int = 0
+    private(set) var safetyOffsetFrames: Int = 0
+    /// Aggregate device's input + output safety offsets and latencies (frames) — what Core Audio adds between capture and output.
+    private(set) var aggregateOverheadFrames: Int = 0
 
     /// Phase 1: create tap + aggregate. Returns the aggregate's sample rate so the caller can prepare the IR.
     func prepare(_ config: Config) throws -> Double {
@@ -67,6 +82,20 @@ final class AudioPipeline {
         aggregateID = agg
         sampleRate = CA.nominalSampleRate(agg) ?? fmt.mSampleRate
         ioBufferFrames = CA.bufferFrameSize(agg) ?? 0
+        let inS = kAudioObjectPropertyScopeInput, outS = kAudioObjectPropertyScopeOutput
+        aggregateOverheadFrames = [
+            CA.get(agg, kAudioDevicePropertySafetyOffset, scope: inS, initial: UInt32(0)),
+            CA.get(agg, kAudioDevicePropertySafetyOffset, scope: outS, initial: UInt32(0)),
+            CA.get(agg, kAudioDevicePropertyLatency, scope: inS, initial: UInt32(0)),
+        ].reduce(0) { $0 + Int($1 ?? 0) }
+        if let dev = CA.device(forUID: config.outputUID) {
+            let out = kAudioObjectPropertyScopeOutput
+            let devLat = Int(CA.get(dev, kAudioDevicePropertyLatency, scope: out, initial: UInt32(0)) ?? 0)
+            let streams = CA.getArray(dev, kAudioDevicePropertyStreams, scope: out, zero: AudioObjectID(0))
+            let streamLat = streams.first.flatMap { CA.get($0, kAudioStreamPropertyLatency, initial: UInt32(0)) }.map(Int.init) ?? 0
+            outputLatencyFrames = devLat + streamLat
+            safetyOffsetFrames = Int(CA.get(dev, kAudioDevicePropertySafetyOffset, scope: out, initial: UInt32(0)) ?? 0)
+        }
         return sampleRate
     }
 
@@ -114,6 +143,11 @@ final class RenderContext {
     private let ticksToSeconds: Double
     var cpuLoad: Double = 0
     var callbacks: UInt64 = 0
+    var ioFrames: Double = 0
+    var computeAvg: Double = 0
+    var computeMax: Double = 0
+    var computeBudget: Double = 0
+    var lastFrames = 0
     private let silence: UnsafeMutablePointer<Float>
     private let silenceFrames = 16384
 
@@ -131,8 +165,14 @@ final class RenderContext {
     deinit { silence.deallocate() }
 
     @inline(__always)
-    func render(_ input: UnsafePointer<AudioBufferList>, _ output: UnsafeMutablePointer<AudioBufferList>) {
+    func render(_ input: UnsafePointer<AudioBufferList>, _ output: UnsafeMutablePointer<AudioBufferList>,
+                inTime: UnsafePointer<AudioTimeStamp>, outTime: UnsafePointer<AudioTimeStamp>) {
         let t0 = mach_absolute_time()
+        let valid = AudioTimeStampFlags.sampleTimeValid
+        if inTime.pointee.mFlags.contains(valid) && outTime.pointee.mFlags.contains(valid) {
+            let d = outTime.pointee.mSampleTime - inTime.pointee.mSampleTime
+            if d > 0 && d < sampleRate { ioFrames = ioFrames == 0 ? d : ioFrames + (d - ioFrames) * 0.05 }
+        }
         let outs = UnsafeMutableAudioBufferListPointer(output)
         let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         guard outs.count > 0 else { return }
@@ -188,6 +228,10 @@ final class RenderContext {
             let elapsed = Double(mach_absolute_time() - t0) * ticksToSeconds
             let budget = Double(frames) / sampleRate
             cpuLoad += (elapsed / budget - cpuLoad) * 0.05
+            computeAvg = computeAvg == 0 ? elapsed : computeAvg + (elapsed - computeAvg) * 0.05
+            if elapsed > computeMax { computeMax = elapsed }
+            computeBudget = budget
+            lastFrames = frames
         }
     }
 }
@@ -200,6 +244,7 @@ private func brirIOProc(_ device: AudioObjectID,
                         _ outputTime: UnsafePointer<AudioTimeStamp>,
                         _ clientData: UnsafeMutableRawPointer?) -> OSStatus {
     guard let clientData else { return noErr }
-    Unmanaged<RenderContext>.fromOpaque(clientData).takeUnretainedValue().render(inputData, outputData)
+    Unmanaged<RenderContext>.fromOpaque(clientData).takeUnretainedValue()
+        .render(inputData, outputData, inTime: inputTime, outTime: outputTime)
     return noErr
 }
