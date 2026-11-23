@@ -120,12 +120,15 @@ final class StereoConvolver {
     // Smoothed state
     private var gain: Double
     private var mix: Double
+    private var dryGain: Double = 1   // 1 = untouched dry (bit-exact bypass); preamp gain while A/B is held
 
     // Shared parameters/meters (written by UI or audio thread; plain aligned words).
     let params = UnsafeMutablePointer<Double>.allocate(capacity: Param.count)
     enum Param {
         static let gain = 0, mixTarget = 1, limiter = 2, peakInL = 3, peakInR = 4, peakOutL = 5, peakOutR = 6, clips = 7
-        static let count = 8
+        /// A/B hold: crossfade to the dry signal *with the preamp applied*, for level-matched comparison.
+        static let abHold = 8
+        static let count = 9
     }
 
     init(ir: TrueStereoIR, blockSize: Int, gainDB: Double, bypass: Bool, limiter: Bool) {
@@ -187,6 +190,7 @@ final class StereoConvolver {
     func setGainDB(_ db: Double) { params[Param.gain] = pow(10, db / 20) }
     func setBypass(_ b: Bool) { params[Param.mixTarget] = b ? 0 : 1 }
     func setLimiter(_ on: Bool) { params[Param.limiter] = on ? 1 : 0 }
+    func setABHold(_ held: Bool) { params[Param.abHold] = held ? 1 : 0 }
 
     @inline(__always)
     private func forward(_ src: UnsafePointer<Double>, re: UnsafeMutablePointer<Double>, im: UnsafeMutablePointer<Double>) {
@@ -244,14 +248,16 @@ final class StereoConvolver {
                  frames: Int) {
         let B = blockSize
         let gTarget = params[Param.gain]
-        let mTarget = params[Param.mixTarget]
+        let abHeld = params[Param.abHold] != 0
+        let mTarget = abHeld ? 0 : params[Param.mixTarget]
+        let dgTarget = abHeld ? gTarget : 1.0
         let limit = params[Param.limiter] != 0
         let gCoef = 1.0 - exp(-1.0 / (0.010 * sampleRate))  // 10 ms one-pole gain smoothing
         let mStep = 1.0 / (0.030 * sampleRate)              // 30 ms linear crossfade
         var pInL = params[Param.peakInL], pInR = params[Param.peakInR]
         var pOutL = params[Param.peakOutL], pOutR = params[Param.peakOutR]
         var clips = params[Param.clips]
-        var g = gain, m = mix
+        var g = gain, m = mix, dg = dryGain
 
         var i = 0
         while i < frames {
@@ -271,14 +277,20 @@ final class StereoConvolver {
                 if m != mTarget {
                     m = m < mTarget ? min(mTarget, m + mStep) : max(mTarget, m - mStep)
                 }
+                if dg != dgTarget {
+                    dg += (dgTarget - dg) * gCoef
+                    if abs(dg - dgTarget) < 1e-12 { dg = dgTarget }
+                }
+                // dg == 1 exactly outside A/B, so dl * dg == dl and bypass stays bit-exact.
+                let gl = dl * dg, gr = dr * dg
                 var yl: Double, yr: Double
                 if m == 0 {
-                    yl = dl; yr = dr                          // bit-exact bypass
+                    yl = gl; yr = gr                          // bypass (bit-exact) or A/B dry with preamp
                 } else {
                     let wl = outL[pos + j] * g, wr = outR[pos + j] * g
                     if m == 1 { yl = wl; yr = wr } else {
-                        yl = dl + (wl - dl) * m
-                        yr = dr + (wr - dr) * m
+                        yl = gl + (wl - gl) * m
+                        yr = gr + (wr - gr) * m
                     }
                     if limit { yl = StereoConvolver.softLimit(yl); yr = StereoConvolver.softLimit(yr) }
                 }
@@ -295,7 +307,7 @@ final class StereoConvolver {
                 pos = 0
             }
         }
-        gain = g; mix = m
+        gain = g; mix = m; dryGain = dg
         params[Param.peakInL] = pInL; params[Param.peakInR] = pInR
         params[Param.peakOutL] = pOutL; params[Param.peakOutR] = pOutR
         params[Param.clips] = clips

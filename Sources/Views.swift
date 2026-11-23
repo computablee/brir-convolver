@@ -48,8 +48,22 @@ struct MainView: View {
 
             Section("Processing") {
                 Toggle("Enable system-wide convolution", isOn: $state.enabled)
-                Toggle("Bypass (bit-exact passthrough, for A/B)", isOn: $state.bypass)
+                Toggle("Bypass (bit-exact passthrough, no preamp)", isOn: $state.bypass)
                     .disabled(!state.enabled)
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("A/B")
+                        Text("Hold to hear the original without the BRIR. The preamp stays on so the levels can be matched.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(action: {}) {
+                        Text(state.abHeld ? "Original (dry)" : "Hold for A/B")
+                            .frame(minWidth: 110)
+                    }
+                    .buttonStyle(HoldButtonStyle(held: state.abHeld) { state.abHeld = $0 })
+                    .disabled(!state.running || state.bypass)
+                }
                 HStack {
                     Text("Preamp")
                     Slider(value: $state.preampDB, in: -30...12, step: 0.1).disabled(state.autoPreamp)
@@ -73,8 +87,9 @@ struct MainView: View {
 
             Section("Status") {
                 HStack {
-                    Circle().fill(state.running ? (state.bypass ? Color.yellow : .green) : .gray).frame(width: 9, height: 9)
-                    Text(state.running && state.bypass ? "\(state.status) (bypassed)" : state.status)
+                    Circle().fill(state.running ? (state.bypass || state.abHeld ? Color.yellow : .green) : .gray).frame(width: 9, height: 9)
+                    Text(state.running && state.abHeld ? "\(state.status) (A/B: dry)"
+                         : state.running && state.bypass ? "\(state.status) (bypassed)" : state.status)
                     Spacer()
                     if state.running {
                         HStack(spacing: 14) {
@@ -136,6 +151,22 @@ struct MainView: View {
         .fileImporter(isPresented: $ui.importing, allowedContentTypes: [.wav, .audio]) { result in
             if case .success(let url) = result { state.loadIR(url: url) }
         }
+    }
+}
+
+/// Momentary button: reports press and release so the app can act while it's held.
+struct HoldButtonStyle: ButtonStyle {
+    let held: Bool
+    let onChange: (Bool) -> Void
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 12).padding(.vertical, 5)
+            .foregroundStyle(held ? Color.black : Color.primary)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(held ? Color.yellow : Color.secondary.opacity(0.18)))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .onChange(of: configuration.isPressed) { _, pressed in onChange(pressed) }
     }
 }
 

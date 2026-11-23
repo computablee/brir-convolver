@@ -19,6 +19,8 @@ final class AppState: ObservableObject {
     @Published var autoPreamp: Bool { didSet { defaults.set(autoPreamp, forKey: "autoPreamp"); if autoPreamp, let s = peakSafeDB { preampDB = s } } }
     @Published var enabled: Bool { didSet { defaults.set(enabled, forKey: "enabled"); enabled ? start() : stop() } }
     @Published var bypass: Bool { didSet { defaults.set(bypass, forKey: "bypass"); pipeline?.convolver?.setBypass(bypass) } }
+    /// Momentary A/B (not persisted): while true, output is the dry signal with the preamp applied.
+    @Published var abHeld = false { didSet { pipeline?.convolver?.setABHold(abHeld) } }
     @Published var limiter: Bool { didSet { defaults.set(limiter, forKey: "limiter"); pipeline?.convolver?.setLimiter(limiter) } }
     @Published var blockSize: Int { didSet { defaults.set(blockSize, forKey: "blockSize"); restartIfRunning() } }
     @Published var driftCompensation: Bool { didSet { defaults.set(driftCompensation, forKey: "driftCompensation"); restartIfRunning() } }
@@ -241,6 +243,7 @@ final class AppState: ObservableObject {
                                            driftCompensation: driftCompensation))
             guard let ir = ir(at: rate) else { p.stop(); return }
             let conv = StereoConvolver(ir: ir, blockSize: blockSize, gainDB: preampDB, bypass: bypass, limiter: limiter)
+            conv.setABHold(abHeld)
             try p.start(convolver: conv)
             pipeline = p
             firTaps = ir.length

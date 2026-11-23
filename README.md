@@ -98,8 +98,11 @@ level difference, and the first reflections.
 - **64-bit DSP.** The WAV is decoded exactly to double. FFTs, spectral multiply-accumulate and the
   inverse transform are all double precision (Accelerate/vDSP). The self-test checks the output against
   a direct time-domain convolution, and the error should sit at the Float32 output floor (≈ −140 dB or better).
-- **Bit-exact bypass.** In bypass the output is the input sample-for-sample, with the same latency as
-  the wet path, so you can A/B without a timing shift. The self-test checks this bit for bit.
+- **A/B and bypass.** Hold the **A/B** button to hear the original without the BRIR, with the preamp
+  still applied, so you can compare at matched levels. The *Bypass* switch is different: it is a
+  bit-exact passthrough (no preamp), so the output is the input sample-for-sample. Both crossfade over
+  30 ms and keep the same latency as the convolved path, so switching causes no timing shift. The
+  self-test checks both: bypass bit for bit, and A/B as exactly the input times the preamp.
 - **Linear by default.** The preamp is an exact scalar gain. The optional limiter is **off** by default.
   *Auto preamp* sets the gain so that no frequency, at either ear, is boosted above 0 dB, using
   max(|LL|+|RL|, |LR|+|RR|). Watch the clip counter if you raise the preamp by hand.

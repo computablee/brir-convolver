@@ -85,6 +85,25 @@ enum SelfTest {
             print("[\(mismatches == 0 ? "PASS" : "FAIL")] bypass bit-exact: \(mismatches) mismatching frames of \(total - B)")
         }
 
+        // ---------- 2b. A/B hold = dry × preamp, exactly ----------
+        do {
+            let B = 256, total = 60_000, gainDB = -7.3
+            let conv = StereoConvolver(ir: ir, blockSize: B, gainDB: gainDB, bypass: false, limiter: false)
+            conv.setABHold(true)
+            let g = pow(10, gainDB / 20)
+            var xl = [Float](repeating: 0, count: total), xr = xl
+            for i in 0..<total { xl[i] = Float.random(in: -1...1, using: &rng); xr[i] = Float.random(in: -1...1, using: &rng) }
+            var yl = [Float](repeating: 0, count: total), yr = yl
+            conv.process(inL: xl, inR: xr, inStride: 1, outL: &yl, outR: &yr, outStride: 1, frames: total)
+            var mismatches = 0
+            let settle = 20_000   // crossfade + gain smoothing fully settled
+            for i in settle..<(total - B) where yl[i + B] != Float(Double(xl[i]) * g) || yr[i + B] != Float(Double(xr[i]) * g) {
+                mismatches += 1
+            }
+            ok = ok && mismatches == 0
+            print("[\(mismatches == 0 ? "PASS" : "FAIL")] A/B hold = dry × preamp (\(gainDB) dB): \(mismatches) mismatching frames of \(total - B - settle)")
+        }
+
         // ---------- 3. Performance ----------
         let rate = ir.sampleRate
         for B in [64, 128, 256, 512] {
