@@ -31,8 +31,8 @@ is excluded automatically. If GraphWorks EQ were tapped, its own output would lo
 1. Double-click `Build and Test.command`. It builds the app, runs the self-test and installs it to
    `/Applications`. You need Xcode or the Command Line Tools (`xcode-select --install`).
 2. Leave **GraphWorks EQ** set as the macOS sound output, with GraphWorks EQ outputting to your DAC as usual.
-3. Open **BRIR Convolver**, drop `BRIR_True_Stereo.wav` onto the window, and turn on
-   *Enable system-wide convolution*.
+3. Open **BRIR Convolver**, drop your 4-channel true-stereo BRIR WAV onto the window (for example one
+   exported from ASH Toolset), and turn on *Enable system-wide convolution*.
 4. The first time, macOS asks for **System Audio Recording** permission. Allow it. If you dismissed the
    prompt, go to System Settings → Privacy & Security → Screen & System Audio Recording →
    *System Audio Recording Only* and enable BRIR Convolver. Each rebuild changes the ad-hoc signature,
@@ -43,10 +43,46 @@ is excluded automatically. If GraphWorks EQ were tapped, its own output would lo
 The headphone icon in the menu bar has quick enable/bypass controls. Closing the window keeps the app
 running.
 
+![Main window](Screenshots/main-window.png)
+
+The **Status** section shows live performance figures:
+- **Added delay** is the latency this app adds: Core Audio capture→output (measured from HAL timestamps)
+  plus the convolver partition. The output device's own reported latency is shown separately, because
+  it applies with or without this app.
+- **DSP** is the compute time per audio callback (average and recent peak) against the callback's deadline.
+- **Load** is that average as a share of the deadline.
+
+## BRIR analysis
+
+Click **Analysis…** in the main window, or choose *BRIR Analysis…* from the menu-bar icon, to inspect
+the loaded impulse response. Orange is the left speaker and blue the right. Solid lines are the
+same-side ear and dashed lines the opposite ear. Hover any chart for exact values, and click a legend
+entry to hide that path. The tiles across the top summarise reverb time (RT60), early decay time (EDT),
+direct-to-reverberant ratio (DRR), clarity (C50) and the interaural level and time differences (ILD, ITD).
+
+**Frequency response:** the EQ the BRIR applies on each speaker-to-ear path, with ¹⁄₄₈ to ⅓-octave smoothing.
+An *Ear sum* mode shows the net colouration of centred content.
+
+![Frequency response](Screenshots/frequency-response.png)
+
+**Reverb decay:** Schroeder energy-decay curves for each path over the 1 ms peak envelope, plus RT60 per
+octave band.
+
+![Reverb decay](Screenshots/reverb-decay.png)
+
+**Spectrogram:** time–frequency energy of all four paths on a shared dB scale.
+
+![Spectrogram](Screenshots/spectrogram.png)
+
+**Impulse:** the raw waveforms over the first 3–100 ms, showing the direct sound, the interaural delay and
+level difference, and the first reflections.
+
+![Impulse](Screenshots/impulse.png)
+
 ## Audio quality notes
 
 - **The audio stream is never resampled by this app.** Convolution runs at whatever rate the output
-  device (GraphWorks EQ's device) is running. If that rate isn't the BRIR's native 48 kHz, only the
+  device (GraphWorks EQ's device) is running. If that rate isn't the BRIR's native rate, only the
   *impulse response* is resampled. That happens once, offline, with a 64-zero-crossing Kaiser-windowed
   sinc in double precision. The status line says "IR native rate" or "IR resampled from …".
 - **64-bit DSP.** The WAV is decoded exactly to double. FFTs, spectral multiply-accumulate and the
@@ -64,9 +100,8 @@ running.
 ## Channel order
 
 For a 4-channel file the default order is **L→L, L→R, R→L, R→R**, the Equalizer APO / ASH-Toolset
-convention. Your file matches that pattern: channels 1 and 4 are the strong same-side ear paths and
-channels 2 and 3 are the opposite-side paths. If the stereo image sounds mirrored or odd, try the
-alternative order in the picker.
+convention: channels 1 and 4 are the strong same-side ear paths and channels 2 and 3 are the
+opposite-side paths. If the stereo image sounds mirrored or odd, try the alternative order in the picker.
 
 ## Troubleshooting
 
@@ -80,5 +115,6 @@ alternative order in the picker.
 ## Rebuild / self-test only
 
 ```
-./build.sh --test ../BRIR_True_Stereo.wav
+./build.sh --test                  # self-test with a built-in synthetic BRIR
+./build.sh --test path/to/brir.wav # or with your own
 ```

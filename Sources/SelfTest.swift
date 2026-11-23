@@ -1,17 +1,23 @@
 import Foundation
 
-/// `BRIRConvolver --selftest file.wav` — verifies the DSP against a direct double-precision
+/// `BRIRConvolver --selftest [file.wav]` — verifies the DSP against a direct double-precision
 /// time-domain convolution, checks bypass is bit-exact, and benchmarks realtime headroom.
+/// Without a file it uses a synthetic true-stereo BRIR, so no impulse response needs to ship with the repo.
 enum SelfTest {
     static func run(wavPath: String) -> Bool {
         var ok = true
         let ir: TrueStereoIR
-        do {
-            let wav = try WAVFile(url: URL(fileURLWithPath: wavPath))
-            print("Loaded \(wavPath): \(wav.channelCount) ch, \(Int(wav.sampleRate)) Hz, \(wav.bitsPerSample)-bit, \(wav.frameCount) frames")
-            ir = try TrueStereoIR(wav: wav, order: .inputMajor)
-        } catch {
-            print("FAIL: \(error.localizedDescription)"); return false
+        if wavPath.isEmpty {
+            ir = syntheticIR()
+            print("Using synthetic true-stereo BRIR: 4 paths, 48000 Hz, \(ir.length) frames (pass a WAV path to test a real one)")
+        } else {
+            do {
+                let wav = try WAVFile(url: URL(fileURLWithPath: wavPath))
+                print("Loaded \(wavPath): \(wav.channelCount) ch, \(Int(wav.sampleRate)) Hz, \(wav.bitsPerSample)-bit, \(wav.frameCount) frames")
+                ir = try TrueStereoIR(wav: wav, order: .inputMajor)
+            } catch {
+                print("FAIL: \(error.localizedDescription)"); return false
+            }
         }
         for (k, n) in ["LL", "LR", "RL", "RR"].enumerated() {
             let e = ir.paths[k].reduce(0) { $0 + $1 * $1 }
@@ -129,5 +135,27 @@ enum SelfTest {
         print("  spectrogram: \(a.specFrames)×\(a.specRows), images \(a.specImages.count)")
         print(ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED")
         return ok
+    }
+
+    /// Deterministic stand-in BRIR: a direct impulse per path (opposite ear ~0.27 ms later and ~9 dB lower),
+    /// followed by exponentially decaying noise (RT60 ≈ 300 ms), 0.75 s at 48 kHz.
+    static func syntheticIR() -> TrueStereoIR {
+        let sr = 48000.0, n = 36000
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func noise() -> Double {   // xorshift64*, uniform in [-1, 1)
+            state ^= state >> 12; state ^= state << 25; state ^= state >> 27
+            return Double((state &* 0x2545_F491_4F6C_DD1D) >> 11) / Double(1 << 52) - 1
+        }
+        let decay = log(1000.0) / (0.3 * sr)   // −60 dB in 300 ms
+        var paths: [[Double]] = []
+        for k in 0..<4 {
+            let ipsi = k == 0 || k == 3
+            var h = [Double](repeating: 0, count: n)
+            let onset = ipsi ? 48 : 61
+            h[onset] = ipsi ? 0.5 : 0.18
+            for i in (onset + 96)..<n { h[i] = 0.04 * noise() * exp(-decay * Double(i - onset)) }
+            paths.append(h)
+        }
+        return TrueStereoIR(paths: paths, sampleRate: sr)
     }
 }

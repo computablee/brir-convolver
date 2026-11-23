@@ -35,7 +35,8 @@ codesign --force --sign - --timestamp=none "$APP" >/dev/null
 echo "Built: $(pwd)/$APP"
 
 if [[ "${1:-}" == "--test" ]]; then
-    "$APP/Contents/MacOS/BRIRConvolver" --selftest "${2:-../BRIR_True_Stereo.wav}"
+    # Optional second argument: a BRIR WAV to test with. Without it a synthetic BRIR is used.
+    "$APP/Contents/MacOS/BRIRConvolver" --selftest "${2:-}"
 fi
 if [[ "${1:-}" == "--install" ]]; then
     rm -rf "/Applications/BRIR Convolver.app"
