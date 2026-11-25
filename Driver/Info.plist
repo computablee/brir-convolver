@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>BRIRConvolverSurround</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.phil.brirconvolver.device</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>BRIR Convolver Surround</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>53F84028-3953-4DD9-8A2F-0E69F2C40A17</key>
+		<string>BRIRConvolverDevice_Create</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<!-- kAudioServerPlugInTypeUUID -->
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>53F84028-3953-4DD9-8A2F-0E69F2C40A17</string>
+		</array>
+	</dict>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.4</string>
+</dict>
+</plist>
