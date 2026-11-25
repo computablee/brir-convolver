@@ -41,6 +41,8 @@ final class Convolver {
     private let outL: UnsafeMutablePointer<Double>  // B wet output of the previous block (pre-gain)
     private let outR: UnsafeMutablePointer<Double>
     private let frameIn: UnsafeMutablePointer<Double> // one frame of input channels
+    /// Peak |sample| per input channel since the UI last read it (the UI resets entries to 0).
+    let inputPeaks: UnsafeMutablePointer<Double>
 
     // Routing tables (flat): source s takes inputs routeChan[routeStart[s] ..< routeStart[s+1]].
     private let routeStart: UnsafeMutablePointer<Int>
@@ -136,6 +138,7 @@ final class Convolver {
         dryL = alloc(fftN); dryR = alloc(fftN)
         outL = alloc(B); outR = alloc(B)
         frameIn = alloc(I)
+        inputPeaks = alloc(I)
 
         // Routing tables
         let totalRoutes = routing.sources.reduce(0) { $0 + $1.inputs.count }
@@ -176,7 +179,7 @@ final class Convolver {
 
     deinit {
         vDSP_destroy_fftsetupD(setup)
-        for p in [hRe, hIm, xRe, xIm, accRe, accIm, time, srcIn, dryL, dryR, outL, outR, frameIn,
+        for p in [hRe, hIm, xRe, xIm, accRe, accIm, time, srcIn, dryL, dryR, outL, outR, frameIn, inputPeaks,
                   routeGain, dryLGain, dryRGain, params] { p.deallocate() }
         for p in [routeStart, routeChan, dryLChan, dryRChan] { p.deallocate() }
         testL?.deallocate(); testR?.deallocate()
@@ -346,7 +349,11 @@ final class Convolver {
                 let f = i + j
                 for c in 0..<I {
                     let v = Double(inputs[c][f * inStrides[c]])
-                    if v.isFinite { frameIn[c] = v } else { frameIn[c] = 0; nonFinite += 1 }
+                    if v.isFinite {
+                        frameIn[c] = v
+                        let a = abs(v)
+                        if a > inputPeaks[c] { inputPeaks[c] = a }
+                    } else { frameIn[c] = 0; nonFinite += 1 }
                 }
                 // Wet inputs: one mixed sample per source.
                 for s in 0..<S {

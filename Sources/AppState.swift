@@ -67,6 +67,10 @@ final class AppState: ObservableObject {
     @Published private(set) var excludedNames: [String] = []
     @Published private(set) var detail: String = ""
     @Published private(set) var routingInfo: String = ""
+    /// Short label for each captured channel (FL, FR, FC, … or the channel number if unused).
+    @Published private(set) var inputLabels: [String] = []
+    /// Which channels carried signal recently, and the format that implies, e.g. "FL FR FC LFE SL SR → 5.1".
+    @Published private(set) var receivingSummary: String = ""
     @Published var meters = Meters()
     @Published private(set) var analysis: IRAnalysis?
     @Published private(set) var analyzing = false
@@ -91,6 +95,11 @@ final class AppState: ObservableObject {
     private var reclaimTimes: [Date] = []
     private var testSegments: [(speaker: Speaker, start: Int)] = []
     private var meterTicks = 0
+    private var inputRoleList: [InputRole] = []
+    /// Meter tick at which each captured channel last exceeded the activity threshold.
+    private var lastActiveTick: [Int] = []
+    private static let activityThresholdDB = -70.0
+    private static let activityHoldTicks = 45   // 3 s at 15 Hz
     private var positionsReload: DispatchWorkItem?
 
     /// Whether the next start should use the surround device.
@@ -104,6 +113,8 @@ final class AppState: ObservableObject {
 
     struct Meters: Equatable {
         var inL = -120.0, inR = -120.0, outL = -120.0, outR = -120.0
+        /// Level of each captured channel (dBFS, peak hold), in capture order.
+        var inputs: [Double] = []
         var clips = 0
         var nonFiniteInput = 0
         var callbacks: UInt64 = 0
@@ -431,6 +442,42 @@ final class AppState: ObservableObject {
 
     func stopSurroundTest() { pipeline?.convolver?.stopTest() }
 
+    /// Summarise which channels carried signal in the last few seconds, and what format that implies.
+    private func updateReceivingSummary() {
+        let active = lastActiveTick.indices.filter { meterTicks - lastActiveTick[$0] <= AppState.activityHoldTicks }
+        guard !active.isEmpty else {
+            if receivingSummary != "Receiving: no signal" { receivingSummary = "Receiving: no signal" }
+            return
+        }
+        var speakers = Set<Speaker>()
+        var otherEar = 0
+        var labels: [String] = []
+        for k in active {
+            labels.append(k < inputLabels.count ? inputLabels[k] : "\(k + 1)")
+            switch k < inputRoleList.count ? inputRoleList[k] : .unused {
+            case .speaker(let s): speakers.insert(s)
+            case .centerSurround: otherEar += 1
+            case .unused: break
+            }
+        }
+        let s = "Receiving: \(labels.joined(separator: " ")) → \(AppState.formatName(speakers, extraEarLevel: otherEar))"
+        if s != receivingSummary { receivingSummary = s }
+    }
+
+    /// "stereo", "5.1", "7.1.4", … from the set of speakers carrying signal.
+    nonisolated static func formatName(_ s: Set<Speaker>, extraEarLevel: Int = 0) -> String {
+        let heights = s.filter(\.isHeight).count
+        let ear = s.filter { !$0.isHeight && $0 != .LFE }.count + extraEarLevel
+        let lfe = s.contains(.LFE) ? 1 : 0
+        if ear == 0 && heights == 0 { return lfe == 1 ? "LFE only" : "unlabelled channels" }
+        if heights == 0 && lfe == 0 && extraEarLevel == 0 {
+            if s == [.FL, .FR] { return "stereo" }
+            if s == [.FC] { return "mono (centre)" }
+            if s.isSubset(of: [.FL, .FR]) { return "one side of stereo" }
+        }
+        return "\(ear).\(lfe)" + (heights > 0 ? ".\(heights)" : "")
+    }
+
     private func updateTestState(_ c: Convolver) {
         let playing = c.testActive
         let pos = c.testPosition
@@ -574,6 +621,10 @@ final class AppState: ObservableObject {
             conv.setABHold(abHeld)
             conv.params[Convolver.Param.reductions] = Double(preampReductions)
             routingInfo = routing.summary
+            inputRoleList = roles
+            inputLabels = roles.enumerated().map { i, r in r == .unused ? "\(i + 1)" : r.short }
+            lastActiveTick = [Int](repeating: Int.min / 2, count: roles.count)
+            receivingSummary = ""
             try p.start(convolver: conv)
             pipeline = p
             firTaps = ir.length
@@ -610,6 +661,7 @@ final class AppState: ObservableObject {
         testPlaying = false
         testSpeaker = nil
         if !keepEnabled || !enabled { status = "Stopped"; detail = ""; routingInfo = "" }
+        receivingSummary = ""
         meters = Meters()
     }
 
@@ -630,6 +682,16 @@ final class AppState: ObservableObject {
         m.inL = max(db(P[K.peakInL]), meters.inL - fall)
         m.inR = max(db(P[K.peakInR]), meters.inR - fall)
         m.outL = max(db(P[K.peakOutL]), meters.outL - fall)
+        let n = c.inputChannels
+        if m.inputs.count != n { m.inputs = [Double](repeating: -120, count: n) }
+        if lastActiveTick.count != n { lastActiveTick = [Int](repeating: Int.min / 2, count: n) }
+        for k in 0..<n {
+            let v = db(c.inputPeaks[k])
+            c.inputPeaks[k] = 0
+            m.inputs[k] = max(v, m.inputs[k] - fall)
+            if v > AppState.activityThresholdDB { lastActiveTick[k] = meterTicks }
+        }
+        if meterTicks % 8 == 0 { updateReceivingSummary() }
         m.outR = max(db(P[K.peakOutR]), meters.outR - fall)
         P[K.peakInL] = 0; P[K.peakInR] = 0; P[K.peakOutL] = 0; P[K.peakOutR] = 0
         m.clips = Int(P[K.clips])

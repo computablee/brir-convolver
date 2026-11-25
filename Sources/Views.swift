@@ -213,8 +213,12 @@ struct MainView: View {
                 }
                 if let e = state.lastError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
                 if state.running {
-                    MeterRow(label: "In", l: state.meters.inL, r: state.meters.inR)
-                    MeterRow(label: "Out", l: state.meters.outL, r: state.meters.outR)
+                    ChannelMeters(title: "In", labels: state.inputLabels, levels: state.meters.inputs)
+                    if !state.receivingSummary.isEmpty {
+                        Text(state.receivingSummary + "  (channels above −70 dBFS in the last 3 s)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ChannelMeters(title: "Out", labels: ["L", "R"], levels: [state.meters.outL, state.meters.outR])
                     if state.meters.nonFiniteInput > 0 {
                         Text("⚠︎ \(state.meters.nonFiniteInput) input samples were NaN/infinite and were replaced with silence.")
                             .font(.caption).foregroundStyle(.orange)
@@ -294,15 +298,26 @@ struct HoldButtonStyle: ButtonStyle {
     }
 }
 
-struct MeterRow: View {
-    let label: String
-    let l: Double
-    let r: Double
+/// One labelled bar per channel, under a title.
+struct ChannelMeters: View {
+    let title: String
+    let labels: [String]
+    let levels: [Double]
     var body: some View {
-        HStack(spacing: 8) {
-            Text(label).font(.caption).frame(width: 28, alignment: .leading)
-            VStack(spacing: 3) { MeterBar(db: l); MeterBar(db: r) }
-            Text(String(format: "%5.1f", max(l, r))).font(.caption.monospacedDigit()).frame(width: 44, alignment: .trailing)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold))
+            ForEach(Array(levels.enumerated()), id: \.offset) { i, db in
+                HStack(spacing: 8) {
+                    Text(i < labels.count ? labels[i] : "\(i + 1)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(db > -70 ? Color.primary : Color.secondary)
+                        .frame(width: 30, alignment: .leading)
+                    MeterBar(db: db)
+                    Text(db <= -119.9 ? "—" : String(format: "%5.1f", db))
+                        .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
         }
     }
 }

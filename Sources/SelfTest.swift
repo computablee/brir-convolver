@@ -48,6 +48,7 @@ enum SelfTest {
         testBypassAndAB(routing: stereo, rate: set.sampleRate)
         testMultichannelBypass(routing: surround, rate: surroundSet.sampleRate)
         testSurroundTestPlayback(routing: stereo, rate: set.sampleRate)
+        testChannelActivity(routing: surround, rate: surroundSet.sampleRate)
         testSurroundTestRender()
 
         // ---------- Performance ----------
@@ -395,6 +396,24 @@ enum SelfTest {
         for k in 0..<len where yl[B + k] != Float(cl[k]) || yr[B + k] != Float(cr[k]) { mismatches += 1 }
         report(started && mismatches == 0 && conv.testFinished && conv.testPosition == len,
                "surround test clip plays exactly, with live input muted: \(mismatches) mismatches of \(len)")
+    }
+
+    /// Per-channel input peaks, and the format names shown in Status.
+    static func testChannelActivity(routing: Routing, rate: Double) {
+        let conv = Convolver(routing: routing, sampleRate: rate, blockSize: 128, gainDB: 0, bypass: false, ceiling: .infinity)
+        var x = noise(channels: 8, count: 4000, active: 0, amp: 0)
+        for i in 0..<4000 { x[2][i] = 0.25 * Float(sin(Double(i) * 0.05)); x[5][i] = -0.5 }   // FC and SR only
+        _ = run(conv, x)
+        let peaks = (0..<8).map { conv.inputPeaks[$0] }
+        let ok = abs(peaks[2] - 0.25) < 1e-3 && peaks[5] == 0.5 && [0, 1, 3, 4, 6, 7].allSatisfy { peaks[$0] == 0 }
+        report(ok, "per-channel input peaks: \(peaks.map { String(format: "%.2f", $0) }.joined(separator: " "))")
+        let names = [
+            AppState.formatName([.FL, .FR]),
+            AppState.formatName([.FL, .FR, .FC, .LFE, .SL, .SR]),
+            AppState.formatName([.FL, .FR, .FC, .LFE, .SL, .SR, .BL, .BR, .TFL, .TFR, .TBL, .TBR]),
+            AppState.formatName([.FL, .FR, .FC, .SL, .SR]),
+        ]
+        report(names == ["stereo", "5.1", "7.1.4", "5.0"], "format names: \(names.joined(separator: ", "))")
     }
 
     static func testSurroundTestRender() {
