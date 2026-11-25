@@ -43,6 +43,8 @@ final class Convolver {
     private let frameIn: UnsafeMutablePointer<Double> // one frame of input channels
     /// Peak |sample| per input channel since the UI last read it (the UI resets entries to 0).
     let inputPeaks: UnsafeMutablePointer<Double>
+    /// Per-input-channel gain, ramped toward 1 (playing) or 0 (muted by a solo).
+    private let channelGain: UnsafeMutablePointer<Double>
 
     // Routing tables (flat): source s takes inputs routeChan[routeStart[s] ..< routeStart[s+1]].
     private let routeStart: UnsafeMutablePointer<Int>
@@ -88,7 +90,9 @@ final class Convolver {
         static let testPos = 11
         /// Input samples that were NaN or infinite (replaced by silence).
         static let nonFiniteInput = 12
-        static let count = 13
+        /// Solo: index of the only input channel to play, or −1 for all.
+        static let solo = 13
+        static let count = 14
     }
 
     init(routing: Routing, sampleRate: Double, blockSize: Int, gainDB: Double, bypass: Bool,
@@ -139,6 +143,9 @@ final class Convolver {
         outL = alloc(B); outR = alloc(B)
         frameIn = alloc(I)
         inputPeaks = alloc(I)
+        let cg = alloc(I)
+        for c in 0..<I { cg[c] = 1 }
+        channelGain = cg
 
         // Routing tables
         let totalRoutes = routing.sources.reduce(0) { $0 + $1.inputs.count }
@@ -175,11 +182,12 @@ final class Convolver {
         params.initialize(repeating: 0, count: Param.count)
         params[Param.gain] = g
         params[Param.mixTarget] = mix
+        params[Param.solo] = -1
     }
 
     deinit {
         vDSP_destroy_fftsetupD(setup)
-        for p in [hRe, hIm, xRe, xIm, accRe, accIm, time, srcIn, dryL, dryR, outL, outR, frameIn, inputPeaks,
+        for p in [hRe, hIm, xRe, xIm, accRe, accIm, time, srcIn, dryL, dryR, outL, outR, frameIn, inputPeaks, channelGain,
                   routeGain, dryLGain, dryRGain, params] { p.deallocate() }
         for p in [routeStart, routeChan, dryLChan, dryRChan] { p.deallocate() }
         testL?.deallocate(); testR?.deallocate()
@@ -190,6 +198,8 @@ final class Convolver {
 
     func setBypass(_ b: Bool) { params[Param.mixTarget] = b ? 0 : 1 }
     func setABHold(_ held: Bool) { params[Param.abHold] = held ? 1 : 0 }
+    /// Play only input channel `ch` (nil = all). Switches with a 5 ms ramp.
+    func setSolo(_ ch: Int?) { params[Param.solo] = Double(ch ?? -1) }
     /// Raise the preamp back to 0 dB (it will drop again as needed). Takes effect at the next block.
     func requestGainReset() { params[Param.resetGain] = 1 }
 
@@ -333,6 +343,8 @@ final class Convolver {
         let abHeld = params[Param.abHold] != 0
         let ts = params[Param.testState]
         let muteInput = ts == 1 || ts == 2 || ts == 4
+        let solo = Int(params[Param.solo])
+        let chCoef = 1.0 - exp(-1.0 / (0.005 * sampleRate))   // 5 ms solo ramp
         let mTarget = abHeld ? 0 : params[Param.mixTarget]
         let gCoef = 1.0 - exp(-1.0 / (0.010 * sampleRate))  // 10 ms one-pole smoothing (A/B dry gain)
         let mStep = 1.0 / (0.030 * sampleRate)              // 30 ms linear crossfade
@@ -349,11 +361,20 @@ final class Convolver {
                 let f = i + j
                 for c in 0..<I {
                     let v = Double(inputs[c][f * inStrides[c]])
+                    var x = 0.0
                     if v.isFinite {
-                        frameIn[c] = v
+                        x = v
                         let a = abs(v)
-                        if a > inputPeaks[c] { inputPeaks[c] = a }
-                    } else { frameIn[c] = 0; nonFinite += 1 }
+                        if a > inputPeaks[c] { inputPeaks[c] = a }   // meters show what arrives, solo or not
+                    } else { nonFinite += 1 }
+                    let target: Double = solo < 0 || solo == c ? 1 : 0
+                    var g = channelGain[c]
+                    if g != target {
+                        g += (target - g) * chCoef
+                        if abs(g - target) < 1e-9 { g = target }
+                        channelGain[c] = g
+                    }
+                    frameIn[c] = g == 1 ? x : x * g   // untouched at unity, so stereo bypass stays bit-exact
                 }
                 // Wet inputs: one mixed sample per source.
                 for s in 0..<S {

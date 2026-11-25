@@ -43,6 +43,8 @@ final class AppState: ObservableObject {
     /// Stock sound used by the surround test.
     @Published var testSound: String { didSet { defaults.set(testSound, forKey: "testSound") } }
     @Published var bypass: Bool { didSet { defaults.set(bypass, forKey: "bypass"); pipeline?.convolver?.setBypass(bypass) } }
+    /// Momentary solo (not persisted): while set, only this captured channel is played.
+    @Published var soloChannel: Int? = nil { didSet { pipeline?.convolver?.setSolo(soloChannel) } }
     /// Momentary A/B (not persisted): while true, output is the dry signal with the preamp applied.
     @Published var abHeld = false { didSet { pipeline?.convolver?.setABHold(abHeld) } }
     @Published var blockSize: Int { didSet { defaults.set(blockSize, forKey: "blockSize"); restartIfRunning() } }
@@ -619,6 +621,7 @@ final class AppState: ObservableObject {
             let routing = Routing.make(brir: ir, roles: roles, lfeGain: lfeGainDB.map { pow(10, $0 / 20) } ?? 0)
             let conv = Convolver(routing: routing, sampleRate: rate, blockSize: blockSize, gainDB: preampDB, bypass: bypass)
             conv.setABHold(abHeld)
+            conv.setSolo(soloChannel)
             conv.params[Convolver.Param.reductions] = Double(preampReductions)
             routingInfo = routing.summary
             inputRoleList = roles

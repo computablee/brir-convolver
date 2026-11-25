@@ -213,7 +213,9 @@ struct MainView: View {
                 }
                 if let e = state.lastError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
                 if state.running {
-                    ChannelMeters(title: "In", labels: state.inputLabels, levels: state.meters.inputs)
+                    ChannelMeters(title: "In — click and hold a channel to hear only that channel",
+                                  labels: state.inputLabels, levels: state.meters.inputs,
+                                  solo: state.soloChannel, onSolo: { state.soloChannel = $0 })
                     if !state.receivingSummary.isEmpty {
                         Text(state.receivingSummary + "  (channels above −70 dBFS in the last 20 s)")
                             .font(.caption).foregroundStyle(.secondary)
@@ -298,27 +300,55 @@ struct HoldButtonStyle: ButtonStyle {
     }
 }
 
-/// One labelled bar per channel, under a title.
+/// One labelled bar per channel, under a title. With `onSolo`, pressing and holding a row solos that channel.
 struct ChannelMeters: View {
     let title: String
     let labels: [String]
     let levels: [Double]
+    var solo: Int? = nil
+    var onSolo: ((Int?) -> Void)? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title).font(.caption.weight(.semibold))
             ForEach(Array(levels.enumerated()), id: \.offset) { i, db in
-                HStack(spacing: 8) {
-                    Text(i < labels.count ? labels[i] : "\(i + 1)")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(db > -70 ? Color.primary : Color.secondary)
-                        .frame(width: 30, alignment: .leading)
-                    MeterBar(db: db)
-                    Text(db <= -119.9 ? "—" : String(format: "%5.1f", db))
-                        .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                        .frame(width: 40, alignment: .trailing)
+                if let onSolo {
+                    Button(action: {}) { row(i, db) }
+                        .buttonStyle(PressReportingStyle(highlighted: solo == i) { onSolo($0 ? i : nil) })
+                        .help("Hold to hear only \(label(i))")
+                } else {
+                    row(i, db)
                 }
             }
         }
+    }
+
+    private func label(_ i: Int) -> String { i < labels.count ? labels[i] : "\(i + 1)" }
+
+    private func row(_ i: Int, _ db: Double) -> some View {
+        HStack(spacing: 8) {
+            Text(label(i))
+                .font(.caption2.monospaced())
+                .foregroundStyle(db > -70 ? Color.primary : Color.secondary)
+                .frame(width: 30, alignment: .leading)
+            MeterBar(db: db)
+            Text(db <= -119.9 ? "—" : String(format: "%5.1f", db))
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 4).padding(.vertical, 1)
+        .contentShape(Rectangle())
+    }
+}
+
+/// Reports press and release of a plain-looking button (for hold-to-solo rows).
+struct PressReportingStyle: ButtonStyle {
+    let highlighted: Bool
+    let onChange: (Bool) -> Void
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(RoundedRectangle(cornerRadius: 4).fill(highlighted ? Color.accentColor.opacity(0.25) : .clear))
+            .onChange(of: configuration.isPressed) { _, pressed in onChange(pressed) }
     }
 }
 

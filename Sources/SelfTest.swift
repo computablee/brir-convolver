@@ -49,6 +49,7 @@ enum SelfTest {
         testMultichannelBypass(routing: surround, rate: surroundSet.sampleRate)
         testSurroundTestPlayback(routing: stereo, rate: set.sampleRate)
         testChannelActivity(routing: surround, rate: surroundSet.sampleRate)
+        testSolo(routing: surround, rate: surroundSet.sampleRate)
         testSurroundTestRender()
 
         // ---------- Performance ----------
@@ -414,6 +415,25 @@ enum SelfTest {
             AppState.formatName([.FL, .FR, .FC, .SL, .SR]),
         ]
         report(names == ["stereo", "5.1", "7.1.4", "5.0"], "format names: \(names.joined(separator: ", "))")
+    }
+
+    /// Soloing a channel must sound exactly like feeding only that channel (once the ramp and the
+    /// previous audio's reverb tail have passed), and the meters must still see every channel.
+    static func testSolo(routing: Routing, rate: Double) {
+        let total = 40_000, settle = 20_000, ch = 4
+        let x = noise(channels: 8, count: total, active: total, amp: 0.3)
+        let a = Convolver(routing: routing, sampleRate: rate, blockSize: 128, gainDB: 0, bypass: false, ceiling: .infinity)
+        a.setSolo(ch)
+        let (al, ar) = run(a, x)
+        var only = [[Float]](repeating: [Float](repeating: 0, count: total), count: 8)
+        only[ch] = x[ch]
+        let b = Convolver(routing: routing, sampleRate: rate, blockSize: 128, gainDB: 0, bypass: false, ceiling: .infinity)
+        let (bl, br) = run(b, only)
+        var maxErr: Float = 0
+        for i in settle..<total { maxErr = max(maxErr, abs(al[i] - bl[i]), abs(ar[i] - br[i])) }
+        let metersSeeAll = (0..<8).allSatisfy { a.inputPeaks[$0] > 0.2 }
+        report(maxErr < 1e-6 && metersSeeAll,
+               String(format: "solo channel %d = that channel alone (max difference %.1e); meters still see all 8", ch + 1, maxErr))
     }
 
     static func testSurroundTestRender() {
