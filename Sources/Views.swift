@@ -215,7 +215,7 @@ struct MainView: View {
                 if state.running {
                     ChannelMeters(title: "In", labels: state.inputLabels, levels: state.meters.inputs)
                     if !state.receivingSummary.isEmpty {
-                        Text(state.receivingSummary + "  (channels above −70 dBFS in the last 3 s)")
+                        Text(state.receivingSummary + "  (channels above −70 dBFS in the last 20 s)")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     ChannelMeters(title: "Out", labels: ["L", "R"], levels: [state.meters.outL, state.meters.outR])

@@ -99,7 +99,7 @@ final class AppState: ObservableObject {
     /// Meter tick at which each captured channel last exceeded the activity threshold.
     private var lastActiveTick: [Int] = []
     private static let activityThresholdDB = -70.0
-    private static let activityHoldTicks = 45   // 3 s at 15 Hz
+    private static let activityHoldTicks = 300  // 20 s at 15 Hz
     private var positionsReload: DispatchWorkItem?
 
     /// Whether the next start should use the surround device.
