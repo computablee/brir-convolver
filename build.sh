@@ -11,7 +11,7 @@ echo "Compiling…"
 xcrun swiftc -O -wmo -parse-as-library -swift-version 5 \
     -target arm64-apple-macos14.4 \
     -framework CoreAudio -framework AudioToolbox -framework Accelerate \
-    -framework AppKit -framework SwiftUI -framework ServiceManagement \
+    -framework AppKit -framework SwiftUI -framework ServiceManagement -framework AVFoundation \
     Sources/*.swift -o "$APP/Contents/MacOS/BRIRConvolver"
 
 cp Info.plist "$APP/Contents/Info.plist"

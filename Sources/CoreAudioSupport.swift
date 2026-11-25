@@ -82,6 +82,13 @@ enum CA {
         return d
     }
 
+    @discardableResult
+    static func setDefaultOutputDevice(_ dev: AudioObjectID) -> Bool {
+        var addr = address(kAudioHardwarePropertyDefaultOutputDevice)
+        var d = dev
+        return AudioObjectSetPropertyData(system, &addr, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &d) == noErr
+    }
+
     static func deviceUID(_ dev: AudioObjectID) -> String? { getString(dev, kAudioDevicePropertyDeviceUID) }
     static func deviceName(_ dev: AudioObjectID) -> String? { getString(dev, kAudioObjectPropertyName) }
 
@@ -199,6 +206,10 @@ enum CA {
             case 11: return .speaker(.SR)           // RightSurroundDirect
             case 33: return .speaker(.BL)           // RearSurroundLeft
             case 34: return .speaker(.BR)           // RearSurroundRight
+            case 13, 49: return .speaker(.TFL)      // LeftTopFront (VerticalHeightLeft), LeftTopMiddle
+            case 15, 51: return .speaker(.TFR)      // RightTopFront (VerticalHeightRight), RightTopMiddle
+            case 16, 52: return .speaker(.TBL)      // TopBackLeft, LeftTopRear
+            case 18, 54: return .speaker(.TBR)      // TopBackRight, RightTopRear
             default: return .unused
             }
         }
@@ -218,6 +229,11 @@ enum CA {
                                     bundleID: getString(obj, kAudioProcessPropertyBundleID) ?? "",
                                     path: executablePath(pid))
         }
+    }
+
+    /// Devices a process is currently playing to.
+    static func processOutputDevices(_ proc: AudioObjectID) -> [AudioObjectID] {
+        getArray(proc, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput, zero: AudioObjectID(0))
     }
 
     static func processObject(forPID pid: pid_t) -> AudioObjectID? {

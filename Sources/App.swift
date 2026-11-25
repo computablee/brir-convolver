@@ -19,7 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationWillTerminate(_ notification: Notification) {
         // Tear down the tap so other apps are unmuted immediately.
-        MainActor.assumeIsolated { AppState.shared.stop(keepEnabled: true) }
+        MainActor.assumeIsolated { AppState.shared.prepareForQuit() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }

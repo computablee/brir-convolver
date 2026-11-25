@@ -58,7 +58,14 @@ final class Convolver {
     private var rampLen = 0
 
     private var mix: Double
-    private var dryGain: Double = 1   // 1 = untouched dry (bit-exact bypass); preamp gain while A/B is held
+    private var dryGain: Double = 1
+
+    // Surround test clip (binaural, already convolved). Written by the UI thread only while the audio thread
+    // isn't using it (test state idle or finished).
+    private var testL: UnsafeMutablePointer<Double>?
+    private var testR: UnsafeMutablePointer<Double>?
+    private var testLen = 0
+    private var testPlayPos = 0   // 1 = untouched dry (bit-exact bypass); preamp gain while A/B is held
 
     // Shared parameters/meters (written by UI or audio thread; plain aligned words).
     let params = UnsafeMutablePointer<Double>.allocate(capacity: Param.count)
@@ -73,7 +80,11 @@ final class Convolver {
         static let abHold = 8
         /// Number of times the preamp has been lowered.
         static let reductions = 9
-        static let count = 10
+        /// Surround test: 0 idle, 1 start requested (UI), 2 playing (audio), 3 finished (audio), 4 stop requested (UI).
+        static let testState = 10
+        /// Frames of the test clip played so far.
+        static let testPos = 11
+        static let count = 12
     }
 
     init(routing: Routing, sampleRate: Double, blockSize: Int, gainDB: Double, bypass: Bool,
@@ -166,6 +177,7 @@ final class Convolver {
         for p in [hRe, hIm, xRe, xIm, accRe, accIm, time, srcIn, dryL, dryR, outL, outR, frameIn,
                   routeGain, dryLGain, dryRGain, params] { p.deallocate() }
         for p in [routeStart, routeChan, dryLChan, dryRChan] { p.deallocate() }
+        testL?.deallocate(); testR?.deallocate()
     }
 
     var latencyFrames: Int { blockSize }
@@ -175,6 +187,32 @@ final class Convolver {
     func setABHold(_ held: Bool) { params[Param.abHold] = held ? 1 : 0 }
     /// Raise the preamp back to 0 dB (it will drop again as needed). Takes effect at the next block.
     func requestGainReset() { params[Param.resetGain] = 1 }
+
+    /// Play a binaural clip through the wet path, ahead of the preamp; live input is muted while it plays.
+    /// Returns false if a clip is still playing.
+    func startTest(left: [Double], right: [Double]) -> Bool {
+        let st = params[Param.testState]
+        guard st == 0 || st == 3 else { return false }
+        testL?.deallocate(); testR?.deallocate()
+        let n = min(left.count, right.count)
+        let l = UnsafeMutablePointer<Double>.allocate(capacity: max(n, 1))
+        let r = UnsafeMutablePointer<Double>.allocate(capacity: max(n, 1))
+        l.initialize(repeating: 0, count: max(n, 1)); r.initialize(repeating: 0, count: max(n, 1))
+        for i in 0..<n { l[i] = left[i]; r[i] = right[i] }
+        testL = l; testR = r; testLen = n
+        params[Param.testPos] = 0
+        params[Param.testState] = 1
+        return true
+    }
+
+    func stopTest() {
+        let st = params[Param.testState]
+        if st == 1 || st == 2 { params[Param.testState] = 4 }
+    }
+
+    var testActive: Bool { let st = params[Param.testState]; return st == 1 || st == 2 || st == 4 }
+    var testFinished: Bool { params[Param.testState] == 3 }
+    var testPosition: Int { Int(params[Param.testPos]) }
 
     @inline(__always)
     private func forward(_ src: UnsafePointer<Double>, re: UnsafeMutablePointer<Double>, im: UnsafeMutablePointer<Double>) {
@@ -224,7 +262,25 @@ final class Convolver {
         dryL.update(from: dryL + B, count: B)
         dryR.update(from: dryR + B, count: B)
         fdlPos = fdlPos + 1 == P ? 0 : fdlPos + 1
+        mixTest()
         planGain()
+    }
+
+    /// Add the next block of the surround-test clip to the block that plays next.
+    @inline(__always)
+    private func mixTest() {
+        let st = params[Param.testState]
+        if st == 4 { params[Param.testState] = 3; return }
+        if st == 1 { testPlayPos = 0; params[Param.testState] = 2 }
+        guard params[Param.testState] == 2, let tl = testL, let tr = testR else { return }
+        let n = min(blockSize, testLen - testPlayPos)
+        if n > 0 {
+            vDSP_vaddD(outL, 1, tl + testPlayPos, 1, outL, 1, vDSP_Length(n))
+            vDSP_vaddD(outR, 1, tr + testPlayPos, 1, outR, 1, vDSP_Length(n))
+            testPlayPos += n
+        }
+        params[Param.testPos] = Double(testPlayPos)
+        if testPlayPos >= testLen { params[Param.testState] = 3 }
     }
 
     /// Choose the gain trajectory for the block that was just computed (it plays next), so that no
@@ -270,6 +326,8 @@ final class Convolver {
                  frames: Int) {
         let B = blockSize, S = sourceCount, W = 2 * B, I = inputChannels
         let abHeld = params[Param.abHold] != 0
+        let ts = params[Param.testState]
+        let muteInput = ts == 1 || ts == 2 || ts == 4
         let mTarget = abHeld ? 0 : params[Param.mixTarget]
         let gCoef = 1.0 - exp(-1.0 / (0.010 * sampleRate))  // 10 ms one-pole smoothing (A/B dry gain)
         let mStep = 1.0 / (0.030 * sampleRate)              // 30 ms linear crossfade
@@ -288,7 +346,7 @@ final class Convolver {
                 for s in 0..<S {
                     var v = 0.0
                     for r in routeStart[s]..<routeStart[s + 1] { v += frameIn[routeChan[r]] * routeGain[r] }
-                    srcIn[s * W + B + pos + j] = v
+                    srcIn[s * W + B + pos + j] = muteInput ? 0 : v
                 }
                 // Dry passthrough. A single unity term is copied as-is, so stereo bypass is bit-exact.
                 var xl = 0.0, xr = 0.0

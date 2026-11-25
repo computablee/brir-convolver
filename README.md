@@ -1,8 +1,9 @@
 # BRIR Convolver
 
 A native macOS app (Apple silicon, macOS 14.4+) that applies a BRIR to **all system audio** and plays the
-result to any output device. It takes true-stereo, HeSuVi 14-channel and ASH Toolset 16-channel BRIRs, and can
-virtualise a 7.1 speaker setup when it is fed multichannel audio (see [7.1 surround](#71-surround)). It can also run alongside a system-wide EQ app such as
+result to any output device. It takes true-stereo, HeSuVi 14-channel and ASH Toolset 16-channel BRIRs, or a folder
+of ASH Toolset directional BRIRs (7.1.4 with height speakers). It virtualises the speaker setup with its own
+built-in surround audio device (see [Surround](#surround)). It can also run alongside a system-wide EQ app such as
 GraphWorks EQ, with the EQ applied after the BRIR (see [Using it with GraphWorks EQ](#using-it-with-graphworks-eq)).
 
 ## Signal flow
@@ -63,38 +64,79 @@ BRIR Convolver never taps GraphWorks EQ: any audio process whose bundle ID or ex
 the chain. Other EQ apps that work through their own virtual output device should chain the same way
 (only GraphWorks EQ has been tested): add their bundle IDs under *Advanced → Also never tap*.
 
-## 7.1 surround
+## Surround
 
-With the default *System audio* capture the app taps the stereo system mix, so only the front L/R speakers of a
-7.1 BRIR are used. Apps only send surround audio to a device that offers multichannel output, so 7.1 needs a
-loopback device:
+### The BRIR Convolver Surround device
 
-1. Install a loopback driver such as [BlackHole](https://github.com/ExistentialAudio/BlackHole) (8ch or 16ch).
-2. In **Audio MIDI Setup**, select BlackHole → *Configure Speakers* → *Multichannel* → **7.1 Surround**.
-3. Make BlackHole the macOS output.
-4. In BRIR Convolver, set *Input → Capture* to BlackHole, and set *Output* explicitly to your DAC or GraphWorks EQ
-   (not *System default output*, which is now BlackHole itself).
-5. Load a HeSuVi or 16-channel BRIR.
+The app ships with **BRIR Convolver Surround**, a 12-channel (7.1.4) virtual audio device. Apps only send
+surround to a device that offers multichannel output; the stereo system tap only ever receives a stereo mix.
+
+1. Under *Input*, click **Install…**. macOS asks for your password once; the device is copied to
+   `/Library/Audio/Plug-Ins/HAL` and Core Audio restarts (all audio drops out for a moment). You can also run
+   `sudo Driver/install.sh` (and `sudo Driver/uninstall.sh`) after `./build.sh`.
+2. Load a surround BRIR (HeSuVi, 16-channel or a directional folder) and enable convolution.
+
+While a surround BRIR is loaded, the app makes the surround device the macOS output, captures from it and
+plays the convolved result to the output it replaced:
 
 ```
-Every app ──▶ BlackHole (7.1) ──▶ BRIR Convolver ──▶ GraphWorks EQ / DAC
-                                  (8 in → 2 ears)
+Every app ──▶ BRIR Convolver Surround (7.1.4) ──▶ BRIR Convolver ──▶ GraphWorks EQ ──▶ DAC
 ```
 
-*Channel layout* defaults to the device's speaker configuration from Audio MIDI Setup. If the device doesn't
-report one, the standard order L R C LFE Ls Rs Lrs Rrs is used. You can also pick an order by hand. The status
-line shows which input feeds which virtual speaker.
+Loading a stereo BRIR, turning convolution off or quitting puts the previous macOS output back.
 
-- **Stereo sources** play through FL/FR only, exactly as with the stereo tap.
+- **Changing the output.** While surround is active, picking another output in macOS (or plugging in headphones
+  that take over) sends the *convolved* audio there; the surround device stays the macOS output.
+- **Volume keys** control the surround device's volume, which is applied before the convolver.
+- **Channel layout.** The device reports a 7.1.4 layout, so there is nothing to set up in Audio MIDI Setup.
+  Stereo sources play through FL/FR, 7.1 sources through the 7.1 bed, and 7.1.4 (Atmos rendered by the playing
+  app) through all twelve channels.
+- **GraphWorks EQ** keeps working: it stays the convolver's output. Set **GraphWorks EQ's own output to your DAC,
+  not System Default.** Otherwise it would play into the surround device once that becomes the default, feeding
+  the convolved audio back into itself. The app watches for this: if GraphWorks EQ (or anything under
+  *Also never tap*) plays into the surround device, surround is paused, the previous output is restored, and a
+  message explains why. Surround also pauses if another app keeps forcing itself back as the macOS output.
+- Uncheck *Use the BRIR Convolver Surround device* to keep the stereo tap (or another capture device) with a
+  surround BRIR.
+
+The device is written from scratch against Apple's AudioServerPlugIn API (`Driver/`). `./build.sh --test` loads
+it in-process and checks its properties, clock, loopback, volume and mute before you install it.
+
+### Other capture devices
+
+Any multichannel loopback device also works as *Capture* (for example BlackHole set to 7.1 in Audio MIDI Setup
+and made the macOS output). Set *Output* to your DAC or GraphWorks EQ, not the system default. *Channel layout*
+defaults to the device's speaker configuration; if it doesn't report one, the standard order
+L R C LFE Ls Rs Lrs Rrs (Ltf Rtf Ltr Rtr) is used, or you can pick an order by hand.
+
+### Routing details
+
 - **LFE** is played through the BRIR's LFE speaker, or through the centre speaker when the LFE BRIR is just a copy
   of the centre one (as ASH exports it). *LFE level* sets its gain (0 dB by default; some players expect +10 dB at
   playback) or turns it off.
-- **Missing speakers:** if the BRIR lacks a speaker the input has (for example 7.1 input on a true-stereo BRIR), its
-  channel folds onto the nearest available speakers at −3 dB.
+- **Missing speakers:** if the BRIR lacks a speaker the input has, its channel folds onto the nearest available
+  speakers at −3 dB (heights fold onto the speakers below them).
 - **16-channel files:** ASH lets you choose the speaker order at export. Pick the same order under
   *16-channel speaker order*.
-- **Dolby Atmos** is rendered by the playing app to whatever bed the device offers (7.1 here); height channels
-  aren't simulated.
+
+### Directional BRIR folders (heights / Dolby Atmos)
+
+Export ASH Toolset's *directional* BRIRs (a folder of stereo `BRIR_E<elevation>_A<azimuth>.wav` files), then drop
+the folder on the window or pick it with *Choose WAV or folder…*. Each virtual speaker uses the exported direction
+nearest its position. The defaults are FL/FR ±30°, centre 0°, sides ±90°, backs ±135° and tops at 45° up, ±45° and
+±135°. Change any of them under *Speaker positions*. Heights are included when the folder has directions at least
+20° up. Export at a spatial resolution that includes elevations around 45°.
+
+Dolby Atmos reaches the convolver as the 7.1.4 bed the playing app renders; individual objects aren't available
+to other apps. Whether an app renders heights at all varies (Apple's apps have been inconsistent about using more
+than 5.1).
+
+### Surround test
+
+*Surround test → Play from each speaker* plays a stock macOS sound (pick it from the list) from each virtual
+speaker in turn: front left, centre, front right, around the back, then the heights. The current speaker is shown
+while it plays. The test is rendered through the BRIRs at −6 dBFS and mixed in before the preamp. Other audio is
+muted while it plays, and the test never makes the adaptive preamp drop.
 
 ## BRIR analysis
 
@@ -162,6 +204,8 @@ level difference, and the first reflections.
 - **Silence after enabling:** check the System Audio Recording permission (step 3) and that the
   *In* meter moves while something plays. With a loopback capture device, check that it is the macOS output
   and that BRIR Convolver's Output is a different device.
+- **No sound after a crash** while surround was active: the macOS output is still BRIR Convolver Surround. Relaunch
+  the app (it restores the output), or pick your usual output in Sound settings.
 - **Clicks or dropouts:** raise the partition size, or try turning off *Drift compensation*.
 - **Using GraphWorks EQ (or another EQ app) and it isn't listed under "Not tapping":** add its bundle ID
   under *Advanced → Also never tap*.
@@ -170,6 +214,6 @@ level difference, and the first reflections.
 ## Rebuild / self-test only
 
 ```
-./build.sh --test                  # self-test with built-in synthetic BRIRs (stereo and 7.1)
+./build.sh --test                  # self-test with built-in synthetic BRIRs (stereo, 7.1, 7.1.4) + driver test
 ./build.sh --test path/to/brir.wav # or with your own
 ```

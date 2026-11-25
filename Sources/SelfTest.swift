@@ -33,6 +33,8 @@ enum SelfTest {
 
         testLoaders()
         testRoutingRules()
+        testDirectionalFolder()
+        testHeightRouting()
 
         // ---------- Accuracy: stereo routing on the loaded/synthetic set, 7.1 routing on a synthetic set ----------
         let stereo = Routing.make(brir: set, roles: Routing.defaultRoles(count: 2), lfeGain: 1)
@@ -45,6 +47,8 @@ enum SelfTest {
         testAdaptivePreamp(routing: stereo, rate: set.sampleRate)
         testBypassAndAB(routing: stereo, rate: set.sampleRate)
         testMultichannelBypass(routing: surround, rate: surroundSet.sampleRate)
+        testSurroundTestPlayback(routing: stereo, rate: set.sampleRate)
+        testSurroundTestRender()
 
         // ---------- Performance ----------
         benchmark(routing: stereo, rate: set.sampleRate, label: "stereo")
@@ -300,6 +304,123 @@ enum SelfTest {
         print("  spectrogram: \(a.specFrames)×\(a.specRows), images \(a.specImages.count)")
     }
 
+    // MARK: - Directional folders, heights, surround test
+
+    static func writeWAV(_ url: URL, channels: [[Double]], rate: Int) throws {
+        let nch = channels.count, n = channels[0].count
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        let dataBytes = n * nch * 4
+        d.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + dataBytes)); d.append(contentsOf: Array("WAVE".utf8))
+        d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(3); u16(UInt16(nch)); u32(UInt32(rate))
+        u32(UInt32(rate * nch * 4)); u16(UInt16(nch * 4)); u16(32)
+        d.append(contentsOf: Array("data".utf8)); u32(UInt32(dataBytes))
+        for i in 0..<n { for c in 0..<nch { u32(Float(channels[c][i]).bitPattern) } }
+        try d.write(to: url)
+    }
+
+    static func testDirectionalFolder() {
+        let parsed = [DirectionalFolder.parse("BRIR_E-15_A30.wav"), DirectionalFolder.parse("BRIR_E0_A-180.wav"),
+                      DirectionalFolder.parse("BRIR_True_Stereo.wav"), DirectionalFolder.parse("notes.txt")]
+        report(parsed[0] == Direction(elevation: -15, azimuth: 30) && parsed[1] == Direction(elevation: 0, azimuth: -180)
+               && parsed[2] == nil && parsed[3] == nil, "directional file names parse (and others are ignored)")
+
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("brir-selftest-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: dir) }
+        let ear: [Direction] = [-135, -90, -30, 0, 30, 90, 135].map { Direction(elevation: 0, azimuth: $0) }
+        let tops: [Direction] = [-45, 45, -135, 135].map { Direction(elevation: 45, azimuth: $0) }
+        let decoy = Direction(elevation: 15, azimuth: -30)
+        var code: [Direction: Double] = [:]
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            for (i, d) in (ear + tops + [decoy]).enumerated() {
+                code[d] = Double(i + 1) / 100
+                try writeWAV(dir.appendingPathComponent("BRIR_E\(d.elevation)_A\(d.azimuth).wav"),
+                             channels: [[code[d]!, 0, 0], [code[d]! + 0.005, 0, 0]], rate: 48000)
+            }
+            try "x".write(to: dir.appendingPathComponent("readme.txt"), atomically: true, encoding: .utf8)
+            let folder = try DirectionalFolder(url: dir)
+            let set = try BRIRSet(folder: folder, positions: [:])
+            func uses(_ s: Speaker, _ d: Direction) -> Bool {
+                guard let ir = set.ir(s) else { return false }
+                return abs(ir.left[0] - code[d]!) < 1e-6 && abs(ir.right[0] - code[d]! - 0.005) < 1e-6
+            }
+            let ok = set.speakers.count == 11 && uses(.FL, Direction(elevation: 0, azimuth: -30))
+                && uses(.FR, Direction(elevation: 0, azimuth: 30)) && uses(.FC, Direction(elevation: 0, azimuth: 0))
+                && uses(.SL, Direction(elevation: 0, azimuth: -90)) && uses(.BR, Direction(elevation: 0, azimuth: 135))
+                && uses(.TFL, Direction(elevation: 45, azimuth: -45)) && uses(.TBR, Direction(elevation: 45, azimuth: 135))
+            report(ok, "directional folder: 11 speakers at their default directions (\(set.chosen.joined(separator: ", ")))")
+            let moved = try BRIRSet(folder: folder, positions: [.FL: Direction(elevation: 10, azimuth: -35),
+                                                               .TFL: Direction(elevation: 30, azimuth: -60)])
+            report(moved.ir(.FL).map { abs($0.left[0] - code[decoy]!) < 1e-6 } == true
+                   && moved.ir(.TFL).map { abs($0.left[0] - code[tops[0]]!) < 1e-6 } == true,
+                   "directional folder: moved speakers snap to the nearest exported direction")
+            // Without anything ≥ 20° up, the heights are left out (they fold down at playback).
+            for d in tops { try fm.removeItem(at: dir.appendingPathComponent("BRIR_E\(d.elevation)_A\(d.azimuth).wav")) }
+            let flat = try BRIRSet(folder: try DirectionalFolder(url: dir), positions: [:])
+            report(flat.speakers.count == 7 && !flat.speakers.contains { $0.speaker.isHeight },
+                   "directional folder without elevated directions: 7 ear-level speakers")
+        } catch {
+            report(false, "directional folder test threw: \(error.localizedDescription)")
+        }
+    }
+
+    static func testHeightRouting() {
+        let roles = Routing.defaultRoles(count: 12)
+        let s7 = syntheticSet(speakers: [.FL, .FR, .FC, .SL, .SR, .BL, .BR], length: 64)
+        let r7 = Routing.make(brir: s7, roles: roles, lfeGain: 1)
+        let h = Routing.minus3dB
+        let fl = r7.sources.first { $0.speaker == .FL }?.inputs ?? []
+        let bl = r7.sources.first { $0.speaker == .BL }?.inputs ?? []
+        report(r7.sources.count == 7 && fl.contains { $0.channel == 8 && abs($0.gain - h) < 1e-12 }
+               && bl.contains { $0.channel == 10 && abs($0.gain - h) < 1e-12 },
+               "7.1.4 input on a 7.1 BRIR: heights fold onto the speakers below at −3 dB")
+        let s11 = syntheticSet(speakers: Speaker.directional, length: 64)
+        let r11 = Routing.make(brir: s11, roles: roles, lfeGain: 1)
+        report(r11.sources.count == 11 && r11.sources.first { $0.speaker == .TBR }?.inputs.first?.channel == 11,
+               "7.1.4 input on a 7.1.4 BRIR: 11 virtual speakers (\(r11.summary))")
+    }
+
+    /// The test clip must come out exactly (added to silence, since live input is muted), delayed one block.
+    static func testSurroundTestPlayback(routing: Routing, rate: Double) {
+        let B = 128, len = 1000
+        let conv = Convolver(routing: routing, sampleRate: rate, blockSize: B, gainDB: 0, bypass: false, ceiling: .infinity)
+        let cl = (0..<len).map { sin(Double($0) * 0.01) * 0.3 }, cr = (0..<len).map { cos(Double($0) * 0.013) * 0.2 }
+        let started = conv.startTest(left: cl, right: cr)
+        let x = noise(channels: 2, count: len + 4 * B, active: len + 4 * B, amp: 0.5)
+        let (yl, yr) = run(conv, x)
+        var mismatches = 0
+        for k in 0..<len where yl[B + k] != Float(cl[k]) || yr[B + k] != Float(cr[k]) { mismatches += 1 }
+        report(started && mismatches == 0 && conv.testFinished && conv.testPosition == len,
+               "surround test clip plays exactly, with live input muted: \(mismatches) mismatches of \(len)")
+    }
+
+    static func testSurroundTestRender() {
+        var rng = SystemRandomNumberGenerator()
+        let x = (0..<300).map { _ in Double.random(in: -1...1, using: &rng) }
+        let h = (0..<200).map { _ in Double.random(in: -1...1, using: &rng) }
+        let y = SurroundTest.convolve(x, h)
+        var err = 0.0
+        for n in 0..<(x.count + h.count - 1) {
+            var ref = 0.0
+            for k in max(0, n - h.count + 1)...min(n, x.count - 1) { ref += x[k] * h[n - k] }
+            err = max(err, abs(ref - y[n]))
+        }
+        report(y.count == 499 && err < 1e-10, String(format: "offline FFT convolution matches direct: max error %.1e", err))
+        let set = syntheticSet(speakers: Speaker.directional, length: 4800)
+        let plan = SurroundTest.render(clip: Array(x.prefix(200)), brir: set)
+        let pk = zip(plan.left, plan.right).reduce(0.0) { max($0, abs($1.0), abs($1.1)) }
+        report(plan.segments.map(\.speaker) == SurroundTest.order && abs(pk - SurroundTest.peak) < 1e-12,
+               "surround test plan: \(plan.segments.count) speakers in order, peak −6 dBFS")
+        let url = SurroundTest.url(for: "Funk")
+        if FileManager.default.fileExists(atPath: url.path) {
+            let clip = try? SurroundTest.loadMono(url, rate: 48000)
+            report((clip?.count ?? 0) > 1000, "stock sound Funk.aiff decodes (\(clip?.count ?? 0) frames at 48 kHz)")
+        }
+    }
+
     // MARK: - Synthetic BRIRs
 
     /// Deterministic stand-in BRIRs: per speaker, a direct impulse at each ear (opposite ear ~0.27 ms later and
@@ -321,7 +442,7 @@ enum SelfTest {
             return h
         }
         let irs: [SpeakerIR] = speakers.enumerated().map { idx, s in
-            let leftSide: Bool? = [.FL, .SL, .BL].contains(s) ? true : [.FR, .SR, .BR].contains(s) ? false : nil
+            let leftSide: Bool? = s.isLeft ? true : s.isRight ? false : nil
             let base = 48 + 3 * idx
             switch leftSide {
             case true?: return SpeakerIR(speaker: s, left: path(onset: base, amp: 0.5), right: path(onset: base + 13, amp: 0.18))

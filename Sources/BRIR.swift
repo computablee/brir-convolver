@@ -1,8 +1,8 @@
 import Foundation
 
-/// A virtual loudspeaker in a 7.1 layout.
+/// A virtual loudspeaker in a 7.1.4 layout.
 enum Speaker: String, CaseIterable, Identifiable {
-    case FL, FR, FC, LFE, SL, SR, BL, BR
+    case FL, FR, FC, LFE, SL, SR, BL, BR, TFL, TFR, TBL, TBR
     var id: String { rawValue }
     var name: String {
         switch self {
@@ -14,8 +14,54 @@ enum Speaker: String, CaseIterable, Identifiable {
         case .SR: return "Side right"
         case .BL: return "Back left"
         case .BR: return "Back right"
+        case .TFL: return "Top front left"
+        case .TFR: return "Top front right"
+        case .TBL: return "Top back left"
+        case .TBR: return "Top back right"
         }
     }
+    var isHeight: Bool { [.TFL, .TFR, .TBL, .TBR].contains(self) }
+    var isLeft: Bool { [.FL, .SL, .BL, .TFL, .TBL].contains(self) }
+    var isRight: Bool { [.FR, .SR, .BR, .TFR, .TBR].contains(self) }
+
+    /// Default position (ITU-R BS.775 / Dolby 7.1.4 style) in ASH Toolset's convention:
+    /// elevation up-positive, azimuth negative to the left.
+    var defaultDirection: Direction {
+        switch self {
+        case .FL: return Direction(elevation: 0, azimuth: -30)
+        case .FR: return Direction(elevation: 0, azimuth: 30)
+        case .FC, .LFE: return Direction(elevation: 0, azimuth: 0)
+        case .SL: return Direction(elevation: 0, azimuth: -90)
+        case .SR: return Direction(elevation: 0, azimuth: 90)
+        case .BL: return Direction(elevation: 0, azimuth: -135)
+        case .BR: return Direction(elevation: 0, azimuth: 135)
+        case .TFL: return Direction(elevation: 45, azimuth: -45)
+        case .TFR: return Direction(elevation: 45, azimuth: 45)
+        case .TBL: return Direction(elevation: 45, azimuth: -135)
+        case .TBR: return Direction(elevation: 45, azimuth: 135)
+        }
+    }
+
+    /// Speakers a directional BRIR folder supplies (LFE uses the centre's).
+    static let directional: [Speaker] = allCases.filter { $0 != .LFE }
+}
+
+/// A direction in ASH Toolset's convention: elevation in degrees (up positive), azimuth in degrees
+/// (0 = front, negative = left, ±180 = behind).
+struct Direction: Hashable, Codable {
+    var elevation: Int
+    var azimuth: Int
+
+    /// Angle between two directions, in degrees.
+    func angle(to o: Direction) -> Double {
+        func v(_ d: Direction) -> (Double, Double, Double) {
+            let e = Double(d.elevation) * .pi / 180, a = Double(d.azimuth) * .pi / 180
+            return (cos(e) * cos(a), cos(e) * sin(a), sin(e))
+        }
+        let (x1, y1, z1) = v(self), (x2, y2, z2) = v(o)
+        return acos(max(-1, min(1, x1 * x2 + y1 * y2 + z1 * z2))) * 180 / .pi
+    }
+    var label: String { "E\(elevation)° A\(azimuth)°" }
 }
 
 /// How the four channels of a true-stereo BRIR file are ordered.
@@ -69,6 +115,8 @@ struct BRIRSet {
     var sampleRate: Double
     /// Human-readable description of the file layout.
     var format: String
+    /// For directional folders: the direction chosen for each speaker.
+    var chosen: [String] = []
 
     var length: Int { speakers.map { max($0.left.count, $0.right.count) }.max() ?? 0 }
     func ir(_ s: Speaker) -> SpeakerIR? { speakers.first { $0.speaker == s } }
@@ -117,6 +165,34 @@ struct BRIRSet {
         }
     }
 
+    /// Build a 7.1(.4) set from a directional folder: each speaker uses the file nearest its position.
+    /// Height speakers are included only if the folder has directions at least 20° up. LFE uses the centre.
+    init(folder: DirectionalFolder, positions: [Speaker: Direction]) throws {
+        var list: [SpeakerIR] = []
+        var rate = 0.0
+        var used: [String] = []
+        for s in Speaker.directional {
+            if s.isHeight && !folder.hasHeights { continue }
+            let want = positions[s] ?? s.defaultDirection
+            let d = folder.nearest(to: want)
+            if s.isHeight && d.elevation < 20 { continue }
+            let wav = try WAVFile(url: folder.files[d]!)
+            guard wav.channelCount == 2 else {
+                throw NSError(domain: "BRIR", code: 3, userInfo: [NSLocalizedDescriptionKey:
+                    "\(folder.files[d]!.lastPathComponent) has \(wav.channelCount) channels; directional BRIRs are stereo (left ear, right ear)."])
+            }
+            if rate == 0 { rate = wav.sampleRate } else if wav.sampleRate != rate {
+                throw NSError(domain: "BRIR", code: 4, userInfo: [NSLocalizedDescriptionKey: "Directional BRIRs have mixed sample rates."])
+            }
+            list.append(SpeakerIR(speaker: s, left: wav.channels[0], right: wav.channels[1]))
+            used.append("\(s.rawValue) \(d.label)")
+        }
+        speakers = list
+        sampleRate = rate
+        chosen = used
+        format = "directional (\(folder.files.count) directions)"
+    }
+
     func resampled(to rate: Double) -> BRIRSet {
         if rate == sampleRate { return self }
         // Each path is independent, so resample them in parallel.
@@ -129,7 +205,9 @@ struct BRIRSet {
             }
         }
         let s = speakers.enumerated().map { i, sp in SpeakerIR(speaker: sp.speaker, left: out[2 * i], right: out[2 * i + 1]) }
-        return BRIRSet(speakers: s, sampleRate: rate, format: format)
+        var r = BRIRSet(speakers: s, sampleRate: rate, format: format)
+        r.chosen = chosen
+        return r
     }
 
     /// A left/right speaker pair viewed as a true-stereo IR (for analysis).
@@ -142,15 +220,63 @@ struct BRIRSet {
 }
 
 enum SpeakerPair: String, CaseIterable, Identifiable {
-    case front = "Front L/R", side = "Side L/R", back = "Back L/R"
+    case front = "Front L/R", side = "Side L/R", back = "Back L/R", topFront = "Top front L/R", topBack = "Top back L/R"
     var id: String { rawValue }
     var speakers: (Speaker, Speaker) {
         switch self {
         case .front: return (.FL, .FR)
         case .side: return (.SL, .SR)
         case .back: return (.BL, .BR)
+        case .topFront: return (.TFL, .TFR)
+        case .topBack: return (.TBL, .TBR)
         }
     }
+}
+
+// MARK: - Directional BRIR folders (ASH Toolset "directional BRIR" export)
+
+/// A folder of stereo WAVs named `BRIR_E<elevation>_A<azimuth>.wav`, one per direction.
+struct DirectionalFolder {
+    let url: URL
+    let files: [Direction: URL]
+
+    static func isDirectional(_ url: URL) -> Bool {
+        var dir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &dir) && dir.boolValue
+    }
+
+    init(url: URL) throws {
+        self.url = url
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        var f: [Direction: URL] = [:]
+        for n in names {
+            guard let d = DirectionalFolder.parse(n) else { continue }
+            f[d] = url.appendingPathComponent(n)
+        }
+        guard !f.isEmpty else {
+            throw NSError(domain: "BRIR", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                "No BRIR_E<elevation>_A<azimuth>.wav files in \(url.lastPathComponent). Export ASH Toolset's directional BRIRs to a folder and choose that folder."])
+        }
+        files = f
+    }
+
+    /// `BRIR_E-15_A30.wav` → elevation −15, azimuth 30.
+    static func parse(_ name: String) -> Direction? {
+        guard name.hasPrefix("BRIR_E"), name.lowercased().hasSuffix(".wav") else { return nil }
+        let core = String(name.dropFirst("BRIR_E".count).dropLast(4))
+        guard let r = core.range(of: "_A"),
+              let e = Int(core[core.startIndex..<r.lowerBound]), let a = Int(core[r.upperBound...]) else { return nil }
+        return Direction(elevation: e, azimuth: a)
+    }
+
+    func nearest(to d: Direction) -> Direction {
+        files.keys.min { a, b in
+            let da = a.angle(to: d), db = b.angle(to: d)
+            return da != db ? da < db : (a.elevation, a.azimuth) < (b.elevation, b.azimuth)
+        }!
+    }
+
+    var hasHeights: Bool { files.keys.contains { $0.elevation >= 20 } }
 }
 
 /// Four impulse responses indexed by `input * 2 + output` (0 = LL, 1 = LR, 2 = RL, 3 = RR). Used for analysis.
@@ -219,6 +345,11 @@ struct Routing {
             case .SR: return has.contains(.BR) ? [(.BR, 1)] : [(.FR, h)]
             case .BL: return has.contains(.SL) ? [(.SL, 1)] : [(.FL, h)]
             case .BR: return has.contains(.SR) ? [(.SR, 1)] : [(.FR, h)]
+            // Heights without height BRIRs fold down onto the ear-level speaker below them, −3 dB.
+            case .TFL: return targets(.FL).map { ($0.0, $0.1 * h) }
+            case .TFR: return targets(.FR).map { ($0.0, $0.1 * h) }
+            case .TBL: return has.contains(.TFL) ? [(.TFL, h)] : targets(.BL).map { ($0.0, $0.1 * h) }
+            case .TBR: return has.contains(.TFR) ? [(.TFR, h)] : targets(.BR).map { ($0.0, $0.1 * h) }
             default: return []
             }
         }
@@ -235,8 +366,8 @@ struct Routing {
                 case .FL: dryL.append((i, 1))
                 case .FR: dryR.append((i, 1))
                 case .FC: dryL.append((i, h)); dryR.append((i, h))
-                case .SL, .BL: dryL.append((i, h))
-                case .SR, .BR: dryR.append((i, h))
+                case .SL, .BL, .TFL, .TBL: dryL.append((i, h))
+                case .SR, .BR, .TFR, .TBR: dryR.append((i, h))
                 case .LFE: break
                 }
             case .centerSurround:
@@ -257,11 +388,11 @@ struct Routing {
         return Routing(inputChannels: roles.count, sources: sources, dryL: dryL, dryR: dryR, summary: summary)
     }
 
-    /// Role of each channel when the device's speaker layout isn't known: standard 7.1 order prefix
-    /// (L R C LFE Ls Rs Lrs Rrs), stereo for 2 channels.
+    /// Role of each channel when the device's speaker layout isn't known: standard 7.1.4 order prefix
+    /// (L R C LFE Ls Rs Lrs Rrs Ltf Rtf Ltr Rtr), stereo for 2 channels.
     static func defaultRoles(count: Int) -> [InputRole] {
         if count == 1 { return [.speaker(.FC)] }
-        let std = SpeakerOrder.standard.speakers
+        let std = SpeakerOrder.standard.speakers + [.TFL, .TFR, .TBL, .TBR]
         return (0..<count).map { $0 < std.count ? .speaker(std[$0]) : .unused }
     }
 }

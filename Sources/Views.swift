@@ -26,7 +26,7 @@ struct MainView: View {
                     }
                     Spacer()
                     Button("Analysis…") { openWindow(id: "viz") }
-                    Button("Choose WAV…") { ui.importing = true }
+                    Button("Choose WAV or folder…") { ui.importing = true }
                 }
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 8)
@@ -46,9 +46,47 @@ struct MainView: View {
                     ForEach(SpeakerOrder.allCases) { Text($0.label).tag($0) }
                 }
                 .disabled(state.irChannels != 16)
-            } header: { Text("Impulse response (drop a true-stereo, HeSuVi 14-channel or ASH 16-channel WAV here)") }
+                if state.isDirectionalFolder {
+                    DisclosureGroup("Speaker positions (nearest exported direction is used)") {
+                        ForEach(Speaker.directional) { sp in
+                            SpeakerPositionRow(speaker: sp)
+                        }
+                        HStack {
+                            Text(state.chosenDirections.joined(separator: " · "))
+                                .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            Spacer()
+                            Button("Defaults") { state.resetPositions() }.controlSize(.small)
+                        }
+                    }
+                }
+            } header: {
+                Text("Impulse response (drop a true-stereo, HeSuVi 14-channel or ASH 16-channel WAV, or a folder of ASH directional BRIRs)")
+            }
 
             Section("Input") {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Toggle("Use the BRIR Convolver Surround device for surround BRIRs", isOn: $state.useVirtualDevice)
+                        Text(state.virtualDeviceInstalled
+                             ? "Installed. While a surround BRIR is loaded it becomes the macOS output; picking another output "
+                               + "in macOS sends the convolved audio there instead (e.g. GraphWorks EQ)."
+                             : "Not installed. Installing asks for your password once and restarts Core Audio.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if state.virtualDeviceInstalled {
+                        Button("Uninstall…") { state.uninstallVirtualDevice() }
+                    }
+                    Button(state.virtualDeviceInstalled ? "Reinstall…" : "Install…") { state.installVirtualDevice() }
+                        .disabled(!VirtualDevice.isBundled)
+                }
+                if state.surroundSuspended {
+                    HStack {
+                        Text("Surround device paused (see the message under Status).").font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Re-enable") { state.resumeSurround() }.controlSize(.small)
+                    }
+                }
                 Picker("Capture", selection: $state.inputUID) {
                     Text("System audio (stereo tap of all apps)").tag("")
                     ForEach(state.inputDevices) { d in Text("\(d.name) (\(d.inputChannels) ch)").tag(d.uid) }
@@ -57,17 +95,18 @@ struct MainView: View {
                     Text("Automatic (device's speaker configuration)").tag(SpeakerOrder?.none)
                     ForEach(SpeakerOrder.allCases) { Text($0.rawValue).tag(SpeakerOrder?.some($0)) }
                 }
-                .disabled(state.usingSystemTap)
+                .disabled(state.usingSystemTap || state.wantsSurround)
                 Picker("LFE level", selection: $state.lfeGainDB) {
                     ForEach(AppState.lfeChoices, id: \.self) { v in
                         Text(v.map { String(format: "%+.0f dB", $0) } ?? "Off").tag(v)
                     }
                 }
                 .disabled(state.usingSystemTap)
-                Text(state.usingSystemTap
-                     ? "Stereo only: the front speaker pair of a 7.1 BRIR is used. For surround, install a loopback driver "
-                       + "(e.g. BlackHole 8ch), set it to 7.1 in Audio MIDI Setup → Configure Speakers, make it the macOS output, "
-                       + "and pick it here."
+                Text(state.wantsSurround
+                     ? "Capturing 7.1.4 from \(VirtualDevice.name) (automatic while a surround BRIR is loaded)."
+                     : state.usingSystemTap
+                     ? "Stereo only: the front speaker pair of a surround BRIR is used. Load a surround BRIR with the "
+                       + "surround device installed, or capture from another multichannel loopback device."
                      : "Apps play into this device and BRIR Convolver plays the result to the Output below, which must be a "
                        + "different device (your DAC or GraphWorks EQ, not the system default).")
                     .font(.caption).foregroundStyle(.secondary)
@@ -109,13 +148,35 @@ struct MainView: View {
                 }
             }
 
+            Section("Surround test") {
+                HStack {
+                    Picker("Sound", selection: $state.testSound) {
+                        ForEach(state.availableTestSounds, id: \.self) { Text($0).tag($0) }
+                    }
+                    .frame(maxWidth: 220)
+                    Spacer()
+                    if state.testPlaying {
+                        Text(state.testSpeaker?.name ?? "Preparing…").monospacedDigit().foregroundStyle(.secondary)
+                        Button("Stop") { state.stopSurroundTest() }
+                    } else {
+                        Button("Play from each speaker") { state.runSurroundTest() }
+                            .disabled(!state.running || state.bypass)
+                    }
+                }
+                Text("Plays the sound from each virtual speaker in turn (front left, centre, front right, around the back, "
+                     + "then the heights), through the BRIR and preamp. Other audio is muted while it plays.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Output") {
                 Picker("Send convolved audio to", selection: $state.outputUID) {
                     Text("System default output").tag(AppState.systemDefaultUID)
                     ForEach(state.devices) { d in Text(d.name).tag(d.uid) }
                 }
                 Text("For GraphWorks EQ: leave GraphWorks EQ as the macOS output (or pick it here). "
-                     + "This app feeds GraphWorks EQ, which applies your headphone EQ last.")
+                     + "This app feeds GraphWorks EQ, which applies your headphone EQ last. While the surround device is "
+                     + "the macOS output, “System default” means the device it replaced. Set GraphWorks EQ's own output "
+                     + "to your DAC rather than System Default.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -184,9 +245,31 @@ struct MainView: View {
         }
         .formStyle(.grouped)
         .frame(minWidth: 560, idealWidth: 620, minHeight: 640)
-        .fileImporter(isPresented: $ui.importing, allowedContentTypes: [.wav, .audio]) { result in
+        .fileImporter(isPresented: $ui.importing, allowedContentTypes: [.wav, .audio, .folder]) { result in
             if case .success(let url) = result { state.loadIR(url: url) }
         }
+    }
+}
+
+/// Elevation/azimuth steppers for one speaker of a directional BRIR folder.
+struct SpeakerPositionRow: View {
+    @ObservedObject var state = AppState.shared
+    let speaker: Speaker
+    var body: some View {
+        let d = state.position(speaker)
+        HStack {
+            Text(speaker.name).frame(width: 120, alignment: .leading)
+            Spacer()
+            Stepper("Elevation \(d.elevation)°", value: Binding(
+                get: { d.elevation },
+                set: { state.setPosition(speaker, Direction(elevation: $0, azimuth: d.azimuth)) }), in: -90...90, step: 5)
+                .monospacedDigit()
+            Stepper("Azimuth \(d.azimuth)°", value: Binding(
+                get: { d.azimuth },
+                set: { state.setPosition(speaker, Direction(elevation: d.elevation, azimuth: $0)) }), in: -180...180, step: 5)
+                .monospacedDigit()
+        }
+        .font(.callout)
     }
 }
 
