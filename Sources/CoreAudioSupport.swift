@@ -46,7 +46,8 @@ enum CA {
         AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
     }
 
-    static func get<T>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+    /// Read a fixed-size property. `T` must be a plain value type: Core Audio writes raw bytes into it.
+    static func get<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, initial: T) -> T? {
         var addr = address(selector, scope)
         var value = initial
@@ -55,7 +56,8 @@ enum CA {
         return st == noErr ? value : nil
     }
 
-    static func getArray<T>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+    /// Read an array property. `T` must be a plain value type: Core Audio writes raw bytes into it.
+    static func getArray<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                             scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, zero: T) -> [T] {
         var addr = address(selector, scope)
         var size: UInt32 = 0
