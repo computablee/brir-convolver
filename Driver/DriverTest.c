@@ -239,11 +239,20 @@ int main(int argc, const char* argv[]) {
     usleep(400000);   // > 16384 / 48000 s
     Float64 st1 = -1; UInt64 h1 = 0;
     (*D)->GetZeroTimeStamp(D, DEVICE, 1, &st1, &h1, &seed);
-    CHECK(st0 == 0 && st1 == 16384 && h1 > h0 && seed == 1, "zero timestamps advance by one period (%.0f → %.0f)", st0, st1);
+    UInt64 seed0 = seed;
+    (*D)->GetZeroTimeStamp(D, DEVICE, 1, &st1, &h1, &seed);
+    CHECK(st0 == 0 && st1 == 16384 && h1 > h0 && seed == seed0, "zero timestamps advance by one period (%.0f → %.0f)", st0, st1);
     UInt32 running = 0;
     Get(DEVICE, kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal, 0, NULL, sizeof(running), &running, NULL);
     CHECK(running == 1, "device reports running");
     CHECK((*D)->StopIO(D, DEVICE, 1) == 0, "StopIO");
+    // A new IO session starts a new timeline, with a new seed.
+    (*D)->StartIO(D, DEVICE, 1);
+    UInt64 seed2 = 0; Float64 st2 = -1; UInt64 h2 = 0;
+    (*D)->GetZeroTimeStamp(D, DEVICE, 1, &st2, &h2, &seed2);
+    CHECK(st2 == 0 && seed2 != seed0, "restarting IO starts a new timeline with a new seed (%llu → %llu)",
+          (unsigned long long)seed0, (unsigned long long)seed2);
+    (*D)->StopIO(D, DEVICE, 1);
 
     printf(failures ? "DRIVER TESTS FAILED (%d)\n" : "ALL DRIVER TESTS PASSED\n", failures);
     return failures ? 1 : 0;

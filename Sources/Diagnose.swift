@@ -109,6 +109,121 @@ enum Diagnose {
         print("  input peaks per channel: \(peaks.joined(separator: " ")), non-finite samples \(st.inNaN)")
         let ok = st.callbacks > 10 && st.inNaN == 0 && st.inPeak[0] > 0.05 && st.inPeak[0] < 0.2
         print(ok ? "[PASS] loopback round trip works" : "[FAIL] loopback round trip (expected ≈0.100 on channels 1–2, no non-finite samples)")
-        return ok
+
+        // Another process plays into the device; does its audio reach the input? Once with this client only
+        // reading, once with it also writing silence to the output (as BRIR Convolver's capture aggregate does).
+        let a = otherClientTest(dev, writeSilence: false)
+        print(a > 0.01 ? String(format: "[PASS] audio from another app reaches the input (peak %.3f)", a)
+                       : String(format: "[FAIL] audio from another app did NOT reach the input (peak %.4f)", a))
+        let b = otherClientTest(dev, writeSilence: true)
+        print(b > 0.01 ? String(format: "[PASS] …also while this client writes silence to the output (peak %.3f)", b)
+                       : String(format: "[FAIL] …a client writing silence to the output wipes other apps' audio (peak %.4f)", b))
+        // Recreate the app's capture aggregate in a few configurations and see which carry another app's audio.
+        let outName = args.drop(while: { $0 != "--diagnose" }).dropFirst().first
+        let outDev = CA.outputDevices().first { d in
+            d.uid != VirtualDevice.uid && (outName.map { d.name.localizedCaseInsensitiveContains($0) }
+                                           ?? !d.name.localizedCaseInsensitiveContains("graphworks"))
+        }
+        var aggOK = true
+        if let o = outDev {
+            print("Aggregate tests with output \(o.name) [\(o.uid)] (pass a name after --diagnose to pick another):")
+            for (label, mainIsOutput, drift) in [("E70-style main + surround, drift on (current app)", true, true),
+                                                 ("main + surround, drift off", true, false),
+                                                 ("surround as main + output, drift on", false, true)] {
+                let r = aggregateTest(output: o.uid, surround: dev, mainIsOutput: mainIsOutput, drift: drift)
+                print(String(format: "  %@ %@: input peak %.3f, callbacks %d, surround driver running during test: %@",
+                             r.peak > 0.01 ? "[PASS]" : "[FAIL]", label, r.peak, r.callbacks, r.driverRunning))
+                if label.hasSuffix("(current app)") { aggOK = r.peak > 0.01 }
+            }
+        } else {
+            print("Aggregate tests skipped: no other output device found.")
+        }
+        return ok && a > 0.01 && b > 0.01 && aggOK
+    }
+
+    static func aggregateTest(output: String, surround dev: AudioObjectID, mainIsOutput: Bool, drift: Bool)
+        -> (peak: Float, callbacks: Int, driverRunning: String) {
+        let sub: [[String: Any]] = mainIsOutput
+            ? [[kAudioSubDeviceUIDKey: output], [kAudioSubDeviceUIDKey: VirtualDevice.uid, kAudioSubDeviceDriftCompensationKey: drift]]
+            : [[kAudioSubDeviceUIDKey: VirtualDevice.uid], [kAudioSubDeviceUIDKey: output, kAudioSubDeviceDriftCompensationKey: drift]]
+        let dict: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "BRIR Convolver Diagnose",
+            kAudioAggregateDeviceUIDKey: "\(AudioPipeline.aggregateUIDPrefix).diag.\(UUID().uuidString)",
+            kAudioAggregateDeviceMainSubDeviceKey: mainIsOutput ? output : VirtualDevice.uid,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: false,
+            kAudioAggregateDeviceSubDeviceListKey: sub,
+        ]
+        var agg = AudioObjectID(0)
+        let st = AudioHardwareCreateAggregateDevice(dict as CFDictionary, &agg)
+        guard st == noErr else { return (-1, 0, "aggregate failed \(st)") }
+        defer { AudioHardwareDestroyAggregateDevice(agg) }
+        Thread.sleep(forTimeInterval: 0.3)
+        final class S { var peak: Float = 0; var callbacks = 0; var inCh = 0 }
+        let s = S()
+        let want = CA.channelCount(dev, scope: kAudioObjectPropertyScopeInput)
+        var procID: AudioDeviceIOProcID?
+        AudioDeviceCreateIOProcIDWithBlock(&procID, agg, nil) { _, inData, _, outData, _ in
+            s.callbacks += 1
+            let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
+            var total = 0
+            for b in ins { total += Int(b.mNumberChannels) }
+            s.inCh = total
+            // The surround device's channels: last `want` when the output is main, first `want` otherwise.
+            let lo = mainIsOutput ? total - want : 0, hi = lo + want
+            var g = 0
+            for b in ins {
+                let n = Int(b.mNumberChannels)
+                defer { g += n }
+                guard n > 0, let d = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                let frames = Int(b.mDataByteSize) / (4 * n)
+                for f in 0..<frames { for c in 0..<n where g + c >= lo && g + c < hi {
+                    let v = abs(d[f * n + c]); if v.isFinite && v > s.peak { s.peak = v }
+                } }
+            }
+            for b in UnsafeMutableAudioBufferListPointer(outData) where b.mData != nil { memset(b.mData!, 0, Int(b.mDataByteSize)) }
+        }
+        guard let pid = procID else { return (-1, 0, "no IOProc") }
+        AudioDeviceStart(agg, pid)
+        Thread.sleep(forTimeInterval: 0.4)
+        // Before anything else plays into it: has the aggregate started the surround device's driver?
+        let running = CA.get(dev, kAudioDevicePropertyDeviceIsRunning, initial: UInt32(9)).map(String.init) ?? "n/a"
+        let say = Process()
+        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        say.arguments = ["-a", "\(dev)", "testing one two three"]
+        try? say.run()
+        say.waitUntilExit()
+        Thread.sleep(forTimeInterval: 0.3)
+        AudioDeviceStop(agg, pid)
+        AudioDeviceDestroyIOProcID(agg, pid)
+        return (s.peak, s.callbacks, running + " (aggregate in channels \(s.inCh))")
+    }
+
+    /// Speak a phrase into the device from a separate process (`say -a`) while reading the device's input.
+    static func otherClientTest(_ dev: AudioObjectID, writeSilence: Bool) -> Float {
+        final class Peak { var v: Float = 0 }
+        let pk = Peak()
+        var procID: AudioDeviceIOProcID?
+        let st = AudioDeviceCreateIOProcIDWithBlock(&procID, dev, nil) { _, inData, _, outData, _ in
+            for b in UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData)) {
+                guard let d = b.mData?.assumingMemoryBound(to: Float.self) else { continue }
+                let n = Int(b.mDataByteSize) / 4
+                for i in 0..<n { let v = abs(d[i]); if v.isFinite && v > pk.v { pk.v = v } }   // all channels: `say` is mono → centre
+            }
+            if writeSilence {
+                for b in UnsafeMutableAudioBufferListPointer(outData) where b.mData != nil { memset(b.mData!, 0, Int(b.mDataByteSize)) }
+            }
+        }
+        guard st == noErr, let pid = procID else { print("  IOProc failed: \(st)"); return -1 }
+        AudioDeviceStart(dev, pid)
+        let say = Process()
+        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        say.arguments = ["-a", "\(dev)", "testing one two three"]
+        print("  \(writeSilence ? "reading + writing silence" : "reading only"): `say -a \(dev)` into the surround device…")
+        do { try say.run(); say.waitUntilExit() } catch { print("  couldn't run say: \(error)") }
+        Thread.sleep(forTimeInterval: 0.3)
+        AudioDeviceStop(dev, pid)
+        AudioDeviceDestroyIOProcID(dev, pid)
+        return pk.v
     }
 }

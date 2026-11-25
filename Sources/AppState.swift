@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreAudio
 import Foundation
 import ServiceManagement
@@ -541,6 +542,25 @@ final class AppState: ObservableObject {
             status = "Waiting for Core Audio…"
             scheduleRestart()
             return
+        }
+        // Reading an input device (the surround device or another loopback) counts as microphone access.
+        // Without it macOS delivers silence rather than an error, so ask first.
+        if !usingSystemTap {
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .authorized: break
+            case .notDetermined:
+                status = "Waiting for microphone permission…"
+                AVCaptureDevice.requestAccess(for: .audio) { _ in
+                    Task { @MainActor in AppState.shared.scheduleRestart() }
+                }
+                return
+            default:
+                status = "Microphone permission needed"
+                lastError = "macOS is withholding audio from the capture device. Allow BRIR Convolver under System Settings → "
+                    + "Privacy & Security → Microphone (reading the surround device counts as microphone access), then turn "
+                    + "convolution off and on. After a rebuild you may need to allow it again."
+                return
+            }
         }
         let excl = usingSystemTap ? computeExclusions() : (ids: Set<AudioObjectID>(), names: [String]())
         let p = AudioPipeline()

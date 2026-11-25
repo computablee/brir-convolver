@@ -4,6 +4,7 @@ build/
 *.iconset
 build.log
 diagnose.log
+driver.log
 
 # Local build-watcher trigger
 .rebuild

@@ -75,6 +75,10 @@ surround to a device that offers multichannel output; the stereo system tap only
    `/Library/Audio/Plug-Ins/HAL` and Core Audio restarts (all audio drops out for a moment). You can also run
    `sudo Driver/install.sh` (and `sudo Driver/uninstall.sh`) after `./build.sh`.
 2. Load a surround BRIR (HeSuVi, 16-channel or a directional folder) and enable convolution.
+3. Allow **Microphone** access when macOS asks. Reading the surround device's input counts as microphone access
+   (no microphone is used). Without it macOS silently delivers silence. If you dismissed the prompt, enable
+   BRIR Convolver under System Settings → Privacy & Security → Microphone. As with System Audio Recording, a
+   rebuild may need the permission granted again.
 
 While a surround BRIR is loaded, the app makes the surround device the macOS output, captures from it and
 plays the convolved result to the output it replaced:

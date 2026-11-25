@@ -11,6 +11,8 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
+#include <dispatch/dispatch.h>
+#include <os/log.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -131,6 +133,13 @@ static Float64 gHostTicksPerSecond = 0;
 static Float64 gHostTicksPerFrame = 0;
 static UInt64 gAnchorHostTime = 0;
 static UInt64 gPeriodCount = 0;
+/// Changes whenever the timeline restarts, so the HAL never mixes timestamps from two timelines.
+static UInt64 gSeed = 1;
+
+// Diagnostics (logged about every 2 s while IO runs): frames read that had data vs read as silence.
+static _Atomic(UInt64) gReadValid = 0, gReadSilent = 0, gWriteCalls = 0;
+static UInt64 gLastLogHost = 0;
+static os_log_t gLog;
 
 static Float32 gRing[kRingFrames * kChannels];
 /// Sample time just past the last frame written. Frames in [gWriteEnd - kRingFrames, gWriteEnd) are valid.
@@ -176,6 +185,13 @@ static void Notify(AudioObjectID obj, AudioObjectPropertySelector sel) {
     if (!gHost) return;
     AudioObjectPropertyAddress a = { sel, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     gHost->PropertiesChanged(gHost, obj, 1, &a);
+}
+
+static void NotifyRunningAsync(void* ctx) { (void)ctx; Notify(kObjectID_Device, kAudioDevicePropertyDeviceIsRunning); }
+
+/// Announce a running-state change outside StartIO/StopIO, which the host calls with its own locks held.
+static void PostRunningChanged(void) {
+    dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), NULL, NotifyRunningAsync);
 }
 
 /// Write a scalar property value; with outData == NULL only report the size.
@@ -457,6 +473,8 @@ static OSStatus Drv_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerP
     mach_timebase_info(&tb);
     gHostTicksPerSecond = 1e9 * (Float64)tb.denom / (Float64)tb.numer;
     gHostTicksPerFrame = gHostTicksPerSecond / gSampleRate;
+    gLog = os_log_create("com.phil.brirconvolver.device", "io");
+    os_log(gLog, "initialized");
     return kAudioHardwareNoError;
 }
 
@@ -601,31 +619,37 @@ static OSStatus Drv_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 // MARK: - IO
 
 static OSStatus Drv_StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client) {
-    (void)client;
     if (d != gDriverRef) return kAudioHardwareBadObjectError;
     if (dev != kObjectID_Device) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gStateMutex);
-    if (gIORunning == 0) {
+    const bool first = gIORunning == 0;
+    if (first) {
         pthread_mutex_lock(&gClockMutex);
         gAnchorHostTime = mach_absolute_time();
         gPeriodCount = 0;
+        ++gSeed;
         gHostTicksPerFrame = gHostTicksPerSecond / gSampleRate;
         pthread_mutex_unlock(&gClockMutex);
         memset(gRing, 0, sizeof(gRing));
         atomic_store(&gWriteEnd, 0);
     }
     if (gIORunning < UINT32_MAX) ++gIORunning;
+    const UInt32 n = gIORunning;
     pthread_mutex_unlock(&gStateMutex);
+    if (gLog) os_log(gLog, "StartIO client %u → %u running%s", client, n, first ? " (new timeline)" : "");
+    if (first) PostRunningChanged();
     return kAudioHardwareNoError;
 }
 
 static OSStatus Drv_StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client) {
-    (void)client;
     if (d != gDriverRef) return kAudioHardwareBadObjectError;
     if (dev != kObjectID_Device) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gStateMutex);
     if (gIORunning > 0) --gIORunning;
+    const UInt32 n = gIORunning;
     pthread_mutex_unlock(&gStateMutex);
+    if (gLog) os_log(gLog, "StopIO client %u → %u running", client, n);
+    if (n == 0) PostRunningChanged();
     return kAudioHardwareNoError;
 }
 
@@ -641,7 +665,7 @@ static OSStatus Drv_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
     while (gAnchorHostTime + (UInt64)((Float64)(gPeriodCount + 1) * ticksPerPeriod) <= now) ++gPeriodCount;
     *outSampleTime = (Float64)gPeriodCount * kRingFrames;
     *outHostTime = gAnchorHostTime + (UInt64)((Float64)gPeriodCount * ticksPerPeriod);
-    *outSeed = 1;
+    *outSeed = gSeed;
     pthread_mutex_unlock(&gClockMutex);
     return kAudioHardwareNoError;
 }
@@ -690,11 +714,23 @@ static void RingWrite(SInt64 start, const Float32* src, UInt32 frames, Float32 g
 /// Read frames back at their sample time; anything never written (or already overwritten) reads as silence.
 static void RingRead(SInt64 start, Float32* dst, UInt32 frames) {
     const SInt64 end = atomic_load(&gWriteEnd);
+    UInt64 valid = 0;
     for (UInt32 f = 0; f < frames; ++f) {
         const SInt64 t = start + f;
         Float32* o = dst + (size_t)f * kChannels;
-        if (t < end && t >= end - kRingFrames) memcpy(o, &gRing[RingIndex(t) * kChannels], kBytesPerFrame);
+        if (t < end && t >= end - kRingFrames) { memcpy(o, &gRing[RingIndex(t) * kChannels], kBytesPerFrame); ++valid; }
         else memset(o, 0, kBytesPerFrame);
+    }
+    atomic_fetch_add(&gReadValid, valid);
+    atomic_fetch_add(&gReadSilent, frames - valid);
+    // Low-rate diagnostics: where reads land relative to what has been written.
+    const UInt64 now = mach_absolute_time();
+    if (gLog && (Float64)(now - gLastLogHost) > 2.0 * gHostTicksPerSecond) {
+        gLastLogHost = now;
+        os_log(gLog, "read t=%lld writeEnd=%lld (read − written %lld) · last 2 s: %llu frames with data, %llu silent, %llu writes",
+               (long long)start, (long long)end, (long long)(start - end),
+               (unsigned long long)atomic_exchange(&gReadValid, 0), (unsigned long long)atomic_exchange(&gReadSilent, 0),
+               (unsigned long long)atomic_exchange(&gWriteCalls, 0));
     }
 }
 
@@ -709,6 +745,7 @@ static OSStatus Drv_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID de
         const Float32 v = atomic_load(&gVolume);
         const Float32 gain = atomic_load(&gMute) ? 0.0f : v * v;
         RingWrite((SInt64)info->mOutputTime.mSampleTime, (const Float32*)ioMainBuffer, frames, gain);
+        atomic_fetch_add(&gWriteCalls, 1);
     } else if (op == kAudioServerPlugInIOOperationReadInput && stream == kObjectID_StreamInput) {
         RingRead((SInt64)info->mInputTime.mSampleTime, (Float32*)ioMainBuffer, frames);
     }

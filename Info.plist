@@ -13,6 +13,8 @@
     <key>LSMinimumSystemVersion</key><string>14.4</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>BRIR Convolver reads surround audio from its BRIR Convolver Surround device (or another loopback device you choose). macOS treats reading any audio input as microphone access; no microphone is used.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>BRIR Convolver captures system audio so it can apply your binaural room impulse response and play it back to your headphones.</string>
 </dict>
