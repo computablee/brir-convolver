@@ -14,28 +14,45 @@ final class AppState: ObservableObject {
     // MARK: Persisted settings
     @Published var irPath: String { didSet { defaults.set(irPath, forKey: "irPath") } }
     @Published var channelOrder: ChannelOrder { didSet { defaults.set(channelOrder.rawValue, forKey: "channelOrder"); reloadIR() } }
+    /// Speaker order of 16-channel BRIR files.
+    @Published var multichannelMapping: SpeakerOrder { didSet { defaults.set(multichannelMapping.rawValue, forKey: "multichannelMapping"); reloadIR() } }
     @Published var outputUID: String { didSet { defaults.set(outputUID, forKey: "outputUID"); restartIfRunning() } }
-    @Published var preampDB: Double { didSet { defaults.set(preampDB, forKey: "preampDB"); pipeline?.convolver?.setGainDB(preampDB) } }
-    @Published var autoPreamp: Bool { didSet { defaults.set(autoPreamp, forKey: "autoPreamp"); if autoPreamp, let s = peakSafeDB { preampDB = s } } }
+    /// Capture device UID; "" = system audio via the stereo process tap.
+    @Published var inputUID: String { didSet { defaults.set(inputUID, forKey: "inputUID"); restartIfRunning() } }
+    /// Channel order of the capture device; nil = automatic (the device's speaker configuration).
+    @Published var inputLayout: SpeakerOrder? { didSet { defaults.set(inputLayout?.rawValue ?? "", forKey: "inputLayout"); restartIfRunning() } }
+    /// Level of LFE input channels in dB; nil = LFE discarded.
+    @Published var lfeGainDB: Double? { didSet { defaults.set(lfeGainDB ?? AppState.lfeOff, forKey: "lfeGainDB"); restartIfRunning() } }
+    /// Adaptive preamp (dB, ≤ 0): starts at 0 dB and only ever drops, by the least needed to avoid clipping.
+    /// Written from the audio thread's value; persisted so a restart doesn't jump back up in level.
+    @Published private(set) var preampDB: Double { didSet { defaults.set(preampDB, forKey: "adaptivePreampDB") } }
+    @Published private(set) var preampReductions = 0
     @Published var enabled: Bool { didSet { defaults.set(enabled, forKey: "enabled"); enabled ? start() : stop() } }
     @Published var bypass: Bool { didSet { defaults.set(bypass, forKey: "bypass"); pipeline?.convolver?.setBypass(bypass) } }
     /// Momentary A/B (not persisted): while true, output is the dry signal with the preamp applied.
     @Published var abHeld = false { didSet { pipeline?.convolver?.setABHold(abHeld) } }
-    @Published var limiter: Bool { didSet { defaults.set(limiter, forKey: "limiter"); pipeline?.convolver?.setLimiter(limiter) } }
     @Published var blockSize: Int { didSet { defaults.set(blockSize, forKey: "blockSize"); restartIfRunning() } }
     @Published var driftCompensation: Bool { didSet { defaults.set(driftCompensation, forKey: "driftCompensation"); restartIfRunning() } }
     @Published var extraExclusions: String { didSet { defaults.set(extraExclusions, forKey: "extraExclusions") } }
+    /// Which speaker pair the analysis window shows.
+    @Published var analysisPair: SpeakerPair = .front { didSet { if let ir = sourceIR { analyzeIR(ir) } } }
+
+    static let lfeOff = -1000.0
+    static let lfeChoices: [Double?] = [nil, -10, -6, -3, 0, 3, 6, 10]
 
     // MARK: Live state
     @Published private(set) var irInfo: String = "No BRIR loaded"
     @Published private(set) var irError: String?
-    @Published private(set) var peakSafeDB: Double?
+    @Published private(set) var irChannels = 0
+    @Published private(set) var availablePairs: [SpeakerPair] = []
     @Published private(set) var devices: [AudioDeviceInfo] = []
+    @Published private(set) var inputDevices: [AudioDeviceInfo] = []
     @Published private(set) var status: String = "Stopped"
     @Published private(set) var running = false
     @Published private(set) var lastError: String?
     @Published private(set) var excludedNames: [String] = []
     @Published private(set) var detail: String = ""
+    @Published private(set) var routingInfo: String = ""
     @Published var meters = Meters()
     @Published private(set) var analysis: IRAnalysis?
     @Published private(set) var analyzing = false
@@ -43,6 +60,8 @@ final class AppState: ObservableObject {
     /// Length of the longest FIR path currently loaded in the convolver, at the processing rate.
     @Published private(set) var firTaps = 0
     @Published private(set) var firRate = 0.0
+
+    var usingSystemTap: Bool { inputUID.isEmpty }
 
     struct Meters: Equatable {
         var inL = -120.0, inR = -120.0, outL = -120.0, outR = -120.0
@@ -60,8 +79,8 @@ final class AppState: ObservableObject {
         var callbackFrames = 0      // output device's self-reported latency (not added by this app)
     }
 
-    private var sourceIR: TrueStereoIR?
-    private var irCache: [Double: TrueStereoIR] = [:]
+    private var sourceIR: BRIRSet?
+    private var irCache: [Double: BRIRSet] = [:]
     private var pipeline: AudioPipeline?
     private var currentExclusions: Set<AudioObjectID> = []
     private var observedDevice: AudioObjectID = 0
@@ -74,19 +93,22 @@ final class AppState: ObservableObject {
         let d = UserDefaults.standard
         irPath = d.string(forKey: "irPath") ?? ""
         channelOrder = ChannelOrder(rawValue: d.string(forKey: "channelOrder") ?? "") ?? .inputMajor
+        multichannelMapping = SpeakerOrder(rawValue: d.string(forKey: "multichannelMapping") ?? "") ?? .standard
         outputUID = d.string(forKey: "outputUID") ?? AppState.systemDefaultUID
-        preampDB = d.object(forKey: "preampDB") as? Double ?? -6
-        autoPreamp = d.object(forKey: "autoPreamp") as? Bool ?? true
+        inputUID = d.string(forKey: "inputUID") ?? ""
+        inputLayout = SpeakerOrder(rawValue: d.string(forKey: "inputLayout") ?? "")
+        let lfe = d.object(forKey: "lfeGainDB") as? Double ?? 0
+        lfeGainDB = lfe <= AppState.lfeOff ? nil : lfe
+        preampDB = min(0, d.object(forKey: "adaptivePreampDB") as? Double ?? 0)
         enabled = d.object(forKey: "enabled") as? Bool ?? false
         bypass = d.bool(forKey: "bypass")
-        limiter = d.bool(forKey: "limiter")
         blockSize = d.object(forKey: "blockSize") as? Int ?? 256
         driftCompensation = d.object(forKey: "driftCompensation") as? Bool ?? true
         extraExclusions = d.string(forKey: "extraExclusions") ?? ""
 
         refreshDevices()
         installSystemListeners()
-        if !irPath.isEmpty { loadIR(url: URL(fileURLWithPath: irPath), keepPreamp: !autoPreamp) }
+        if !irPath.isEmpty { loadIR(url: URL(fileURLWithPath: irPath), keepPreamp: true) }
         if enabled { start() }
 
         meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
@@ -96,31 +118,37 @@ final class AppState: ObservableObject {
 
     // MARK: IR
 
+    /// Load a BRIR file. A different file starts the adaptive preamp again from 0 dB.
     func loadIR(url: URL, keepPreamp: Bool = false) {
         do {
             let wav = try WAVFile(url: url)
-            let ir = try TrueStereoIR(wav: wav, order: channelOrder)
+            let ir = try BRIRSet(wav: wav, order: channelOrder, mapping: multichannelMapping)
+            let isNewFile = url.path != irPath
             sourceIR = ir
             irCache = [ir.sampleRate: ir]
+            irChannels = wav.channelCount
+            availablePairs = ir.availablePairs
+            if !availablePairs.contains(analysisPair) { analysisPair = .front }
             analyzeIR(ir)
             irError = nil
             irPath = url.path
-            let safe = ir.peakSafeGainDB()
-            peakSafeDB = safe
-            if autoPreamp || !keepPreamp { preampDB = (safe * 10).rounded(.down) / 10 }
+            if !keepPreamp || isNewFile { resetPreamp() }
             let ms = Double(wav.frameCount) / wav.sampleRate * 1000
-            irInfo = "\(url.lastPathComponent) — \(wav.channelCount) ch, \(Int(wav.sampleRate)) Hz, "
+            irInfo = "\(url.lastPathComponent) — \(ir.format) (\(ir.speakerList)), \(Int(wav.sampleRate)) Hz, "
                 + "\(wav.bitsPerSample)-bit \(wav.isFloat ? "float" : "PCM"), \(wav.frameCount) samples (\(String(format: "%.0f", ms)) ms)"
             restartIfRunning()
         } catch {
             irError = error.localizedDescription
             sourceIR = nil
+            irChannels = 0
+            availablePairs = []
             irInfo = "No BRIR loaded"
             stop(keepEnabled: true)
         }
     }
 
-    private func analyzeIR(_ ir: TrueStereoIR) {
+    private func analyzeIR(_ set: BRIRSet) {
+        guard let ir = set.pair(analysisPair) ?? set.pair(.front) else { return }
         analysisID += 1
         let id = analysisID
         analyzing = true
@@ -139,7 +167,7 @@ final class AppState: ObservableObject {
         loadIR(url: URL(fileURLWithPath: irPath), keepPreamp: true)
     }
 
-    private func ir(at rate: Double) -> TrueStereoIR? {
+    private func ir(at rate: Double) -> BRIRSet? {
         guard let src = sourceIR else { return nil }
         if let c = irCache[rate] { return c }
         let r = src.resampled(to: rate)
@@ -147,9 +175,37 @@ final class AppState: ObservableObject {
         return r
     }
 
+    /// Raise the adaptive preamp back to 0 dB; it drops again only as far as the audio requires.
+    func resetPreamp() {
+        preampDB = 0
+        preampReductions = 0
+        if let c = pipeline?.convolver {
+            c.requestGainReset()
+            c.params[Convolver.Param.reductions] = 0
+        }
+    }
+
+    /// Role of each captured channel.
+    private func inputRoles(channels: Int) -> [InputRole] {
+        if usingSystemTap { return Routing.defaultRoles(count: channels) }
+        if let manual = inputLayout {
+            let sp = manual.speakers
+            return (0..<channels).map { $0 < sp.count ? .speaker(sp[$0]) : .unused }
+        }
+        if let uid = inputUID.isEmpty ? nil : inputUID, let dev = CA.device(forUID: uid),
+           let labels = CA.speakerLabels(dev), let roles = CA.roles(for: labels) {
+            // The layout may describe fewer or more channels than the device has.
+            return (0..<channels).map { $0 < roles.count ? roles[$0] : .unused }
+        }
+        return Routing.defaultRoles(count: channels)
+    }
+
     // MARK: Devices & processes
 
-    func refreshDevices() { devices = CA.outputDevices() }
+    func refreshDevices() {
+        devices = CA.outputDevices()
+        inputDevices = CA.inputDevices()
+    }
 
     var resolvedOutputUID: String? {
         if outputUID != AppState.systemDefaultUID, CA.device(forUID: outputUID) != nil { return outputUID }
@@ -198,7 +254,7 @@ final class AppState: ObservableObject {
         }
         CA.listen(CA.system, kAudioHardwarePropertyProcessObjectList) { [weak self] in
             Task { @MainActor in
-                guard let self, self.running else { return }
+                guard let self, self.running, self.usingSystemTap else { return }
                 if self.computeExclusions().ids != self.currentExclusions { self.scheduleRestart() }
             }
         }
@@ -236,14 +292,18 @@ final class AppState: ObservableObject {
             scheduleRestart()
             return
         }
-        let excl = computeExclusions()
+        let excl = usingSystemTap ? computeExclusions() : (ids: Set<AudioObjectID>(), names: [String]())
         let p = AudioPipeline()
         do {
-            let rate = try p.prepare(.init(outputUID: uid, excludedProcesses: Array(excl.ids),
-                                           driftCompensation: driftCompensation))
+            let rate = try p.prepare(.init(outputUID: uid, inputUID: usingSystemTap ? nil : inputUID,
+                                           excludedProcesses: Array(excl.ids), driftCompensation: driftCompensation))
             guard let ir = ir(at: rate) else { p.stop(); return }
-            let conv = StereoConvolver(ir: ir, blockSize: blockSize, gainDB: preampDB, bypass: bypass, limiter: limiter)
+            let roles = inputRoles(channels: p.inputChannels)
+            let routing = Routing.make(brir: ir, roles: roles, lfeGain: lfeGainDB.map { pow(10, $0 / 20) } ?? 0)
+            let conv = Convolver(routing: routing, sampleRate: rate, blockSize: blockSize, gainDB: preampDB, bypass: bypass)
             conv.setABHold(abHeld)
+            conv.params[Convolver.Param.reductions] = Double(preampReductions)
+            routingInfo = routing.summary
             try p.start(convolver: conv)
             pipeline = p
             firTaps = ir.length
@@ -255,10 +315,9 @@ final class AppState: ObservableObject {
             running = true
             lastError = nil
             let resampled = sourceIR.map { $0.sampleRate != rate } ?? false
-            let tf = p.tapFormat
             status = "Running → \(p.outputName)"
             let latencyMs = Double(blockSize) / rate * 1000
-            detail = "\(Int(rate)) Hz · tap \(Int(tf.mSampleRate)) Hz/\(tf.mChannelsPerFrame) ch · "
+            detail = "\(Int(rate)) Hz · \(p.inputDescription) · \(conv.sourceCount) virtual speakers · "
                 + "\(conv.partitions) partitions × \(blockSize) · +\(String(format: "%.1f", latencyMs)) ms · IO \(p.ioBufferFrames) frames"
                 + (resampled ? " · IR resampled from \(Int(sourceIR!.sampleRate)) Hz" : " · IR native rate")
         } catch {
@@ -277,7 +336,7 @@ final class AppState: ObservableObject {
         }
         rateListener = nil
         running = false
-        if !keepEnabled || !enabled { status = "Stopped"; detail = "" }
+        if !keepEnabled || !enabled { status = "Stopped"; detail = ""; routingInfo = "" }
         meters = Meters()
     }
 
@@ -291,7 +350,7 @@ final class AppState: ObservableObject {
         guard let p = pipeline, let c = p.convolver else { return }
         func db(_ v: Double) -> Double { v > 0 ? max(-120, 20 * log10(v)) : -120 }
         let P = c.params
-        typealias K = StereoConvolver.Param
+        typealias K = Convolver.Param
         var m = meters
         // Peak hold with ~20 dB/s fall
         let fall = 20.0 / 15.0
@@ -301,6 +360,10 @@ final class AppState: ObservableObject {
         m.outR = max(db(P[K.peakOutR]), meters.outR - fall)
         P[K.peakInL] = 0; P[K.peakInR] = 0; P[K.peakOutL] = 0; P[K.peakOutR] = 0
         m.clips = Int(P[K.clips])
+        let g = c.gainDB
+        if abs(g - preampDB) > 0.001 { preampDB = min(0, g) }
+        let red = Int(P[K.reductions])
+        if red != preampReductions { preampReductions = red }
         m.cpu = p.cpuLoad
         // Delay this app adds, from Core Audio timestamps (output sample time − tap input sample time
         // inside one IOProc cycle) plus the convolver's partition. The output device's own reported latency
@@ -323,7 +386,7 @@ final class AppState: ObservableObject {
         if m != meters { meters = m }
     }
 
-    func resetClips() { pipeline?.convolver?.params[StereoConvolver.Param.clips] = 0 }
+    func resetClips() { pipeline?.convolver?.params[Convolver.Param.clips] = 0 }
 
     // MARK: Launch at login
 

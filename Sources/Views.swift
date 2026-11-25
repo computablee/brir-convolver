@@ -23,9 +23,6 @@ struct MainView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(state.irInfo).font(.callout).lineLimit(2)
                         if let e = state.irError { Text(e).font(.caption).foregroundStyle(.red) }
-                        else if let s = state.peakSafeDB {
-                            Text("Peak-safe preamp: \(s, specifier: "%.2f") dB").font(.caption).foregroundStyle(.secondary)
-                        }
                     }
                     Spacer()
                     Button("Analysis…") { openWindow(id: "viz") }
@@ -41,14 +38,47 @@ struct MainView: View {
                     }
                     return true
                 }
-                Picker("Channel order", selection: $state.channelOrder) {
+                Picker("4-channel order", selection: $state.channelOrder) {
                     ForEach(ChannelOrder.allCases) { Text($0.label).tag($0) }
                 }
-            } header: { Text("Impulse response (drop a 4-channel true-stereo WAV here)") }
+                .disabled(state.irChannels != 4)
+                Picker("16-channel speaker order", selection: $state.multichannelMapping) {
+                    ForEach(SpeakerOrder.allCases) { Text($0.label).tag($0) }
+                }
+                .disabled(state.irChannels != 16)
+            } header: { Text("Impulse response (drop a true-stereo, HeSuVi 14-channel or ASH 16-channel WAV here)") }
+
+            Section("Input") {
+                Picker("Capture", selection: $state.inputUID) {
+                    Text("System audio (stereo tap of all apps)").tag("")
+                    ForEach(state.inputDevices) { d in Text("\(d.name) (\(d.inputChannels) ch)").tag(d.uid) }
+                }
+                Picker("Channel layout", selection: $state.inputLayout) {
+                    Text("Automatic (device's speaker configuration)").tag(SpeakerOrder?.none)
+                    ForEach(SpeakerOrder.allCases) { Text($0.rawValue).tag(SpeakerOrder?.some($0)) }
+                }
+                .disabled(state.usingSystemTap)
+                Picker("LFE level", selection: $state.lfeGainDB) {
+                    ForEach(AppState.lfeChoices, id: \.self) { v in
+                        Text(v.map { String(format: "%+.0f dB", $0) } ?? "Off").tag(v)
+                    }
+                }
+                .disabled(state.usingSystemTap)
+                Text(state.usingSystemTap
+                     ? "Stereo only: the front speaker pair of a 7.1 BRIR is used. For surround, install a loopback driver "
+                       + "(e.g. BlackHole 8ch), set it to 7.1 in Audio MIDI Setup → Configure Speakers, make it the macOS output, "
+                       + "and pick it here."
+                     : "Apps play into this device and BRIR Convolver plays the result to the Output below, which must be a "
+                       + "different device (your DAC or GraphWorks EQ, not the system default).")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !state.routingInfo.isEmpty {
+                    Text(state.routingInfo).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
 
             Section("Processing") {
                 Toggle("Enable system-wide convolution", isOn: $state.enabled)
-                Toggle("Bypass (bit-exact passthrough, no preamp)", isOn: $state.bypass)
+                Toggle("Bypass (passthrough, no preamp; multichannel input is downmixed to stereo)", isOn: $state.bypass)
                     .disabled(!state.enabled)
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -65,14 +95,18 @@ struct MainView: View {
                     .disabled(!state.running || state.bypass)
                 }
                 HStack {
-                    Text("Preamp")
-                    Slider(value: $state.preampDB, in: -30...12, step: 0.1).disabled(state.autoPreamp)
-                    TextField("", value: $state.preampDB, format: .number.precision(.fractionLength(1)))
-                        .frame(width: 56).multilineTextAlignment(.trailing).disabled(state.autoPreamp)
-                    Text("dB").foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Preamp (adaptive)")
+                        Text("Starts at 0 dB and drops only as far as needed to keep the output below 0 dBFS. "
+                             + "It never rises on its own; reset it after something loud."
+                             + (state.preampReductions > 0 ? " Lowered \(state.preampReductions)× since the last reset." : ""))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(String(format: "%.2f dB", state.preampDB)).monospacedDigit()
+                    Button("Reset to 0 dB") { state.resetPreamp() }
+                        .disabled(state.preampDB == 0)
                 }
-                Toggle("Auto preamp (peak-safe: no frequency boosted above 0 dB)", isOn: $state.autoPreamp)
-                Toggle("Safety limiter above −1 dBFS (off = purely linear)", isOn: $state.limiter)
             }
 
             Section("Output") {
@@ -121,24 +155,26 @@ struct MainView: View {
                     MeterRow(label: "Out", l: state.meters.outL, r: state.meters.outR)
                     if state.meters.clips > 0 {
                         HStack {
-                            Text("⚠︎ \(state.meters.clips) samples over 0 dBFS — lower the preamp")
+                            Text("⚠︎ \(state.meters.clips) samples over 0 dBFS (bypass / A/B passthrough)")
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
                             Button("Reset") { state.resetClips() }.controlSize(.small)
                         }
                     }
                 }
-                Text(state.excludedNames.isEmpty
-                     ? "Not tapping: this app. (GraphWorks EQ not detected.)"
-                     : "Not tapping: this app, \(state.excludedNames.joined(separator: ", "))")
-                    .font(.caption).foregroundStyle(.secondary)
+                if state.usingSystemTap {
+                    Text(state.excludedNames.isEmpty
+                         ? "Not tapping: this app. (GraphWorks EQ not detected.)"
+                         : "Not tapping: this app, \(state.excludedNames.joined(separator: ", "))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             Section("Advanced") {
                 Picker("Partition size (latency vs. CPU)", selection: $state.blockSize) {
                     ForEach([64, 128, 256, 512, 1024, 2048], id: \.self) { Text("\($0) samples").tag($0) }
                 }
-                Toggle("Tap drift compensation", isOn: $state.driftCompensation)
+                Toggle("Drift compensation (tap or capture device)", isOn: $state.driftCompensation)
                 HStack {
                     TextField("Also never tap (comma-separated bundle IDs / names)", text: $state.extraExclusions)
                     Button("Apply") { state.applyExclusionChanges() }

@@ -109,6 +109,13 @@ struct VisualizerView: View {
                 Text(state.irInfo).font(.caption).foregroundColor(VizTheme.text2).lineLimit(1)
             }
             Spacer()
+            if state.availablePairs.count > 1 {
+                Picker("", selection: $state.analysisPair) {
+                    ForEach(state.availablePairs) { Text($0.rawValue).tag($0) }
+                }
+                .labelsHidden()
+                .frame(width: 130)
+            }
             Picker("", selection: $ui.tab) {
                 ForEach(VizUI.Tab.allCases) { Text($0.rawValue).tag($0) }
             }
