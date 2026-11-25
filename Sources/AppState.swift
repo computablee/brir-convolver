@@ -104,6 +104,9 @@ final class AppState: ObservableObject {
     struct Meters: Equatable {
         var inL = -120.0, inR = -120.0, outL = -120.0, outR = -120.0
         var clips = 0
+        var nonFiniteInput = 0
+        var callbacks: UInt64 = 0
+        var starved: UInt64 = 0
         var cpu = 0.0
         var addedDelayMs = 0.0      // what this app adds: Core Audio capture→output + convolver partition
         var ioMs = 0.0
@@ -610,6 +613,9 @@ final class AppState: ObservableObject {
         m.outR = max(db(P[K.peakOutR]), meters.outR - fall)
         P[K.peakInL] = 0; P[K.peakInR] = 0; P[K.peakOutL] = 0; P[K.peakOutR] = 0
         m.clips = Int(P[K.clips])
+        m.nonFiniteInput = Int(P[K.nonFiniteInput])
+        m.callbacks = p.callbacks
+        m.starved = p.starvedCallbacks
         updateTestState(c)
         meterTicks += 1
         if meterTicks % 30 == 0 { checkForFeedbackLoop() }   // every 2 s

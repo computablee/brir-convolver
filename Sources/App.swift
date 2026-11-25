@@ -9,6 +9,9 @@ enum Entry {
             let path = i + 1 < args.count ? args[i + 1] : ""
             exit(SelfTest.run(wavPath: path) ? 0 : 1)
         }
+        if args.contains("--diagnose") {
+            exit(Diagnose.run(args: args) ? 0 : 1)
+        }
         BRIRConvolverApp.main()
     }
 }

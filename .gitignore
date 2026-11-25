@@ -3,6 +3,7 @@ build/
 *.app
 *.iconset
 build.log
+diagnose.log
 
 # Local build-watcher trigger
 .rebuild

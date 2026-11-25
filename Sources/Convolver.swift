@@ -84,7 +84,9 @@ final class Convolver {
         static let testState = 10
         /// Frames of the test clip played so far.
         static let testPos = 11
-        static let count = 12
+        /// Input samples that were NaN or infinite (replaced by silence).
+        static let nonFiniteInput = 12
+        static let count = 13
     }
 
     init(routing: Routing, sampleRate: Double, blockSize: Int, gainDB: Double, bypass: Bool,
@@ -334,6 +336,7 @@ final class Convolver {
         var pInL = params[Param.peakInL], pInR = params[Param.peakInR]
         var pOutL = params[Param.peakOutL], pOutR = params[Param.peakOutR]
         var clips = params[Param.clips]
+        var nonFinite = params[Param.nonFiniteInput]
         var m = mix, dg = dryGain
 
         var i = 0
@@ -341,7 +344,10 @@ final class Convolver {
             let n = min(frames - i, B - pos)
             for j in 0..<n {
                 let f = i + j
-                for c in 0..<I { frameIn[c] = Double(inputs[c][f * inStrides[c]]) }
+                for c in 0..<I {
+                    let v = Double(inputs[c][f * inStrides[c]])
+                    if v.isFinite { frameIn[c] = v } else { frameIn[c] = 0; nonFinite += 1 }
+                }
                 // Wet inputs: one mixed sample per source.
                 for s in 0..<S {
                     var v = 0.0
@@ -402,6 +408,7 @@ final class Convolver {
         params[Param.peakInL] = pInL; params[Param.peakInR] = pInR
         params[Param.peakOutL] = pOutL; params[Param.peakOutR] = pOutR
         params[Param.clips] = clips
+        params[Param.nonFiniteInput] = nonFinite
     }
 
     /// Convenience for strided stereo input (tests).

@@ -206,14 +206,19 @@ struct MainView: View {
                     Text(String(format: "Delay: I/O %.1f ms + partition %.1f ms = %.1f ms added · output device reports %.1f ms",
                                 m.ioMs, m.partitionMs, m.addedDelayMs, m.downstreamMs))
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %d-frame callback, against a %.2f ms deadline (%.0f× headroom at peak).",
-                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0))
+                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %d-frame callback, against a %.2f ms deadline (%.0f× headroom at peak). %llu callbacks, %llu with missing input.",
+                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0,
+                                m.callbacks, m.starved))
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
                 if let e = state.lastError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
                 if state.running {
                     MeterRow(label: "In", l: state.meters.inL, r: state.meters.inR)
                     MeterRow(label: "Out", l: state.meters.outL, r: state.meters.outR)
+                    if state.meters.nonFiniteInput > 0 {
+                        Text("⚠︎ \(state.meters.nonFiniteInput) input samples were NaN/infinite and were replaced with silence.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
                     if state.meters.clips > 0 {
                         HStack {
                             Text("⚠︎ \(state.meters.clips) samples over 0 dBFS (bypass / A/B passthrough)")

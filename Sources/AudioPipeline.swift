@@ -32,6 +32,7 @@ final class AudioPipeline {
     var convolver: Convolver? { context?.convolver }
     var cpuLoad: Double { context?.cpuLoad ?? 0 }
     var callbacks: UInt64 { context?.callbacks ?? 0 }
+    var starvedCallbacks: UInt64 { context?.starvedCallbacks ?? 0 }
     /// Frames between the input time and the output time inside our IOProc (measured from HAL timestamps).
     var measuredIOFrames: Double { context?.ioFrames ?? 0 }
     /// Compute time per IOProc callback (seconds): smoothed average, worst since last reset, and the deadline.
@@ -184,6 +185,8 @@ final class RenderContext {
     var computeMax: Double = 0
     var computeBudget: Double = 0
     var lastFrames = 0
+    /// Callbacks where the capture side delivered fewer frames than the output needed.
+    var starvedCallbacks: UInt64 = 0
     private let silence: UnsafeMutablePointer<Float>
     private let inPtrs: UnsafeMutablePointer<UnsafePointer<Float>>
     private let inStrides: UnsafeMutablePointer<Int>
@@ -258,8 +261,14 @@ final class RenderContext {
             for k in 0..<min(-first, channels) { inPtrs[k] = UnsafePointer(silence); inStrides[k] = 0 }
         }
         if inFrames == Int.max { inFrames = frames }
+        // If the capture side delivered less than a full buffer, play this cycle on silent input rather than
+        // skipping it, so the output (and the surround test) keeps running.
+        if inFrames < frames {
+            for k in 0..<channels { inPtrs[k] = UnsafePointer(silence); inStrides[k] = 0 }
+            starvedCallbacks &+= 1
+        }
 
-        let n = min(frames, inFrames)
+        let n = frames
         if n > 0 {
             convolver.process(inputs: inPtrs, inStrides: inStrides, outL: dstL, outR: dstR, outStride: outStride, frames: n)
         }
