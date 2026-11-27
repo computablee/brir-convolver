@@ -221,6 +221,9 @@ struct MainView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     ChannelMeters(title: "Out", labels: ["L", "R"], levels: [state.meters.outL, state.meters.outR])
+                    if let hint = state.captureHint {
+                        Text("⚠︎ " + hint).font(.caption).foregroundStyle(.orange)
+                    }
                     if state.meters.nonFiniteInput > 0 {
                         Text("⚠︎ \(state.meters.nonFiniteInput) input samples were NaN/infinite and were replaced with silence.")
                             .font(.caption).foregroundStyle(.orange)
@@ -255,6 +258,7 @@ struct MainView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { state.refreshLaunchAtLogin() }
         .frame(minWidth: 560, idealWidth: 620, minHeight: 640)
         .fileImporter(isPresented: $ui.importing, allowedContentTypes: [.wav, .audio, .folder]) { result in
             if case .success(let url) = result { state.loadIR(url: url) }

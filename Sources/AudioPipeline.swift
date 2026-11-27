@@ -30,6 +30,10 @@ final class AudioPipeline {
     private(set) var ioBufferFrames: Int = 0
     private(set) var outputName = ""
     var convolver: Convolver? { context?.convolver }
+    /// The realtime context, for timing-health logging.
+    var renderContext: RenderContext? { context }
+    private var listeners: [(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyListenerBlock)] = []
+    private(set) var overloads = 0
     var cpuLoad: Double { context?.cpuLoad ?? 0 }
     var callbacks: UInt64 { context?.callbacks ?? 0 }
     var starvedCallbacks: UInt64 { context?.starvedCallbacks ?? 0 }
@@ -89,12 +93,28 @@ final class AudioPipeline {
             desc.uuid = UUID()
             desc.isPrivate = true
             desc.muteBehavior = CATapMuteBehavior.mutedWhenTapped
+            // Right after the previous tap is destroyed, Core Audio often hands back a tap that isn't ready yet
+            // (object 0 / no format). Retry briefly in place rather than failing the whole start.
             var tap = AudioObjectID(kAudioObjectUnknown)
-            try check(AudioHardwareCreateProcessTap(desc, &tap), "Creating system audio tap")
-            tapID = tap
-            guard let fmt = CA.get(tap, kAudioTapPropertyFormat, initial: AudioStreamBasicDescription()) else {
-                teardown(); throw CAError(what: "Reading tap format", status: -1)
+            var format: AudioStreamBasicDescription?
+            var lastStatus: OSStatus = noErr
+            for attempt in 1...6 {
+                desc.uuid = UUID()
+                var t = AudioObjectID(kAudioObjectUnknown)
+                lastStatus = AudioHardwareCreateProcessTap(desc, &t)
+                if lastStatus == noErr, t != kAudioObjectUnknown,
+                   let f = CA.get(t, kAudioTapPropertyFormat, initial: AudioStreamBasicDescription()) {
+                    tap = t; format = f
+                    if attempt > 1 { Log.pipeline.notice("tap ready on attempt \(attempt)") }
+                    break
+                }
+                if t != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(t) }
+                Log.pipeline.notice("tap not ready (attempt \(attempt), status \(lastStatus)); retrying in 0.2 s")
+                Thread.sleep(forTimeInterval: 0.2)
             }
+            try check(lastStatus, "Creating system audio tap")
+            guard let fmt = format else { throw CAError(what: "Reading tap format", status: -1) }
+            tapID = tap
             inputChannels = max(1, Int(fmt.mChannelsPerFrame))
             fallbackRate = fmt.mSampleRate
             inputDescription = "tap \(Int(fmt.mSampleRate)) Hz/\(fmt.mChannelsPerFrame) ch"
@@ -112,6 +132,32 @@ final class AudioPipeline {
         } catch { teardown(); throw error }
         aggregateID = agg
         sampleRate = CA.nominalSampleRate(agg) ?? fallbackRate
+        let outDevForLog = CA.device(forUID: config.outputUID)
+        Log.pipeline.notice("""
+            prepared: capture \(self.inputDescription, privacy: .public) → output \(self.outputName, privacy: .public)             (\(outDevForLog.flatMap(CA.nominalSampleRate).map { String(Int($0)) } ?? "?", privacy: .public) Hz),             aggregate \(Int(self.sampleRate)) Hz, buffer \(CA.bufferFrameSize(agg) ?? 0) frames,             drift compensation \(config.driftCompensation, privacy: .public)
+            """)
+        watch(agg, kAudioDeviceProcessorOverload) { [weak self] in
+            self?.overloads += 1
+            Log.health.error("aggregate reported an IO overload (CPU or scheduling could not keep up)")
+        }
+        watch(agg, kAudioDevicePropertyDeviceIsAlive) {
+            Log.pipeline.error("aggregate device died (IsAlive changed)")
+        }
+        watch(agg, kAudioDevicePropertyNominalSampleRate) {
+            Log.pipeline.notice("aggregate sample rate changed → \(CA.nominalSampleRate(agg).map { String(Int($0)) } ?? "?", privacy: .public) Hz")
+        }
+        if let od = outDevForLog {
+            watch(od, kAudioDevicePropertyDeviceIsAlive) {
+                Log.pipeline.error("output device IsAlive changed (unplugged or its driver restarted)")
+            }
+        }
+        if tapID != kAudioObjectUnknown {
+            let tap = tapID
+            watch(tap, kAudioTapPropertyFormat) {
+                let f = CA.get(tap, kAudioTapPropertyFormat, initial: AudioStreamBasicDescription())
+                Log.pipeline.notice("tap format changed → \(Int(f?.mSampleRate ?? 0)) Hz / \(f?.mChannelsPerFrame ?? 0) ch")
+            }
+        }
         ioBufferFrames = CA.bufferFrameSize(agg) ?? 0
         let inS = kAudioObjectPropertyScopeInput, outS = kAudioObjectPropertyScopeOutput
         aggregateOverheadFrames = [
@@ -140,12 +186,28 @@ final class AudioPipeline {
                       "Creating IOProc")
             procID = proc
             try check(AudioDeviceStart(aggregateID, proc), "Starting audio device")
-        } catch { teardown(); throw error }
+        } catch {
+            Log.pipeline.error("start failed: \(error.localizedDescription, privacy: .public)")
+            teardown(); throw error
+        }
+        Log.pipeline.notice("IO started")
     }
 
     func stop() { teardown() }
 
+    /// False once Core Audio has torn down our process tap (it then no longer answers its format).
+    var tapIsAlive: Bool {
+        tapID == kAudioObjectUnknown || CA.get(tapID, kAudioTapPropertyFormat, initial: AudioStreamBasicDescription()) != nil
+    }
+
+    private func watch(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector, _ handler: @escaping () -> Void) {
+        let block = CA.listen(obj, sel, handler)
+        listeners.append((obj, sel, block))
+    }
+
     private func teardown() {
+        for (obj, sel, block) in listeners { CA.unlisten(obj, sel, block) }
+        listeners = []
         if let p = procID {
             AudioDeviceStop(aggregateID, p)
             AudioDeviceDestroyIOProcID(aggregateID, p)
@@ -187,6 +249,20 @@ final class RenderContext {
     var lastFrames = 0
     /// Callbacks where the capture side delivered fewer frames than the output needed.
     var starvedCallbacks: UInt64 = 0
+
+    // Timing health, read (and the min/max reset) by the UI thread every couple of seconds.
+    /// Callbacks whose input / output sample time didn't continue from the previous callback.
+    var inJumps: UInt64 = 0, outJumps: UInt64 = 0
+    /// Rate scalars reported by Core Audio (actual ÷ nominal sample rate) since the last reset.
+    var inRateMin = 10.0, inRateMax = 0.0, outRateMin = 10.0, outRateMax = 0.0
+    /// Latest sample/host times, to measure the real rate of each side between two UI reads.
+    var inSampleNow = 0.0, outSampleNow = 0.0
+    var inHostNow: UInt64 = 0, outHostNow: UInt64 = 0
+    /// Callbacks whose processing took longer than the time available.
+    var overruns: UInt64 = 0
+    /// Worst callback compute time (s) since the health log last read it.
+    var computeWorst: Double = 0
+    private var lastInSample = -1.0, lastOutSample = -1.0
     private let silence: UnsafeMutablePointer<Float>
     private let inPtrs: UnsafeMutablePointer<UnsafePointer<Float>>
     private let inStrides: UnsafeMutablePointer<Int>
@@ -215,6 +291,25 @@ final class RenderContext {
         if inTime.pointee.mFlags.contains(valid) && outTime.pointee.mFlags.contains(valid) {
             let d = outTime.pointee.mSampleTime - inTime.pointee.mSampleTime
             if d > 0 && d < sampleRate { ioFrames = ioFrames == 0 ? d : ioFrames + (d - ioFrames) * 0.05 }
+        }
+        let it = inTime.pointee, ot = outTime.pointee
+        if it.mFlags.contains(valid) {
+            if lastInSample >= 0, abs(it.mSampleTime - (lastInSample + Double(lastFrames))) > 0.5 { inJumps &+= 1 }
+            lastInSample = it.mSampleTime
+            inSampleNow = it.mSampleTime
+            if it.mFlags.contains(.hostTimeValid) { inHostNow = it.mHostTime }
+            if it.mFlags.contains(.rateScalarValid) {
+                inRateMin = min(inRateMin, it.mRateScalar); inRateMax = max(inRateMax, it.mRateScalar)
+            }
+        }
+        if ot.mFlags.contains(valid) {
+            if lastOutSample >= 0, abs(ot.mSampleTime - (lastOutSample + Double(lastFrames))) > 0.5 { outJumps &+= 1 }
+            lastOutSample = ot.mSampleTime
+            outSampleNow = ot.mSampleTime
+            if ot.mFlags.contains(.hostTimeValid) { outHostNow = ot.mHostTime }
+            if ot.mFlags.contains(.rateScalarValid) {
+                outRateMin = min(outRateMin, ot.mRateScalar); outRateMax = max(outRateMax, ot.mRateScalar)
+            }
         }
         let outs = UnsafeMutableAudioBufferListPointer(output)
         let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
@@ -280,6 +375,8 @@ final class RenderContext {
             cpuLoad += (elapsed / budget - cpuLoad) * 0.05
             computeAvg = computeAvg == 0 ? elapsed : computeAvg + (elapsed - computeAvg) * 0.05
             if elapsed > computeMax { computeMax = elapsed }
+            if elapsed > budget { overruns &+= 1 }
+            if elapsed > computeWorst { computeWorst = elapsed }
             computeBudget = budget
             lastFrames = frames
         }

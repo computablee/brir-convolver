@@ -73,6 +73,9 @@ final class AppState: ObservableObject {
     @Published private(set) var inputLabels: [String] = []
     /// Which channels carried signal recently, and the format that implies, e.g. "FL FR FC LFE SL SR → 5.1".
     @Published private(set) var receivingSummary: String = ""
+    /// Explanation shown when the system tap hears nothing although Apple Music is playing.
+    @Published private(set) var captureHint: String?
+    private var silentWhileMusicPlays = 0
     @Published var meters = Meters()
     @Published private(set) var analysis: IRAnalysis?
     @Published private(set) var analyzing = false
@@ -143,6 +146,8 @@ final class AppState: ObservableObject {
     private var restartWork: DispatchWorkItem?
     private var meterTimer: Timer?
     private var restarting = false
+    /// Consecutive failed starts, for retry back-off (reset on success).
+    private var failedStarts = 0
 
     private init() {
         let d = UserDefaults.standard
@@ -343,7 +348,7 @@ final class AppState: ObservableObject {
             return
         }
         if let u = CA.deviceUID(newDevice) { defaults.set(u, forKey: AppState.restoreKey) }
-        scheduleRestart()
+        scheduleRestart("macOS output changed away from the surround device")
     }
 
     /// Feedback guard: an EQ app (GraphWorks EQ or anything on the exclusion list) playing *into* the surround
@@ -369,8 +374,9 @@ final class AppState: ObservableObject {
         surroundActive = false
         reclaimTimes = []
         lastError = message
+        Log.pipeline.error("surround suspended: \(message, privacy: .public)")
         restoreDefaultOutput()
-        scheduleRestart()
+        scheduleRestart("surround suspended")
     }
 
     func resumeSurround() {
@@ -443,6 +449,79 @@ final class AppState: ObservableObject {
     }
 
     func stopSurroundTest() { pipeline?.convolver?.stopTest() }
+
+    /// Previous health sample: (input sample time, input host time, output sample time, output host time,
+    /// callbacks, starved, overruns, in jumps, out jumps).
+    private var healthPrev: (Double, UInt64, Double, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64)?
+
+    /// Log the realtime path's timing every 2 s: the measured rate of capture and output clocks
+    /// (a slowing capture clock is what "sounds like a record being held"), timestamp jumps, overruns.
+    private func logHealth(_ p: AudioPipeline) {
+        guard let r = p.renderContext else { return }
+        let ticks = ticksToSeconds
+        let now = (r.inSampleNow, r.inHostNow, r.outSampleNow, r.outHostNow, r.callbacks, r.starvedCallbacks, r.overruns, r.inJumps, r.outJumps)
+        defer { healthPrev = now }
+        guard let prev = healthPrev else { return }
+        func rate(_ s1: Double, _ h1: UInt64, _ s0: Double, _ h0: UInt64) -> String {
+            guard h1 > h0 else { return "n/a" }
+            return String(format: "%.1f", (s1 - s0) / (Double(h1 - h0) * ticks))
+        }
+        let inRate = rate(now.0, now.1, prev.0, prev.1), outRate = rate(now.2, now.3, prev.2, prev.3)
+        let scal = String(format: "in %.4f–%.4f out %.4f–%.4f", r.inRateMin, r.inRateMax, r.outRateMin, r.outRateMax)
+        r.inRateMin = 10; r.inRateMax = 0; r.outRateMin = 10; r.outRateMax = 0
+        let line = "capture \(inRate) Hz, output \(outRate) Hz (nominal \(Int(r.sampleRate))) · rate scalars \(scal) · "
+            + "callbacks +\(now.4 &- prev.4), short input +\(now.5 &- prev.5), overruns +\(now.6 &- prev.6), "
+            + "time jumps in +\(now.7 &- prev.7) out +\(now.8 &- prev.8), overload events \(p.overloads) · "
+            + String(format: "load %.0f%%, worst callback %.2f ms, IO %.0f frames", r.cpuLoad * 100, r.computeWorst * 1000, r.ioFrames)
+        r.computeWorst = 0
+        let abnormal = now.5 != prev.5 || now.6 != prev.6 || now.7 != prev.7 || now.8 != prev.8
+        if abnormal { Log.health.error("\(line, privacy: .public)") } else { Log.health.notice("\(line, privacy: .public)") }
+
+        checkSilentTap()
+
+        // Watchdog: Core Audio can stop the capture tap (or the whole aggregate) underneath us, e.g. after a
+        // burst of Bluetooth reconfigurations. Rebuild the capture path instead of staying silent.
+        if now.4 == prev.4 {
+            Log.health.error("watchdog: no audio callbacks for 2 s; rebuilding the capture path")
+            scheduleRestart("watchdog: IO callbacks stopped")
+        } else if !p.tapIsAlive {
+            Log.health.error("watchdog: the system audio tap no longer exists; rebuilding the capture path")
+            scheduleRestart("watchdog: tap disappeared")
+        } else if now.1 != 0 && now.0 == prev.0 {
+            Log.health.error("watchdog: capture time stopped advancing for 2 s; rebuilding the capture path")
+            scheduleRestart("watchdog: capture stalled")
+        }
+    }
+
+    /// With AirPods, Apple Music plays Dolby Atmos tracks through head-tracked Spatial Audio, which bypasses the
+    /// system tap: the tap then hears silence while Music is muted. Detect that and say what to do.
+    private func checkSilentTap() {
+        let inMax = meters.inputs.max() ?? -120
+        var musicPlaying = false
+        if usingSystemTap && inMax < -100 {
+            musicPlaying = CA.processObjects().contains {
+                $0.bundleID == "com.apple.Music"
+                    && (CA.get($0.objectID, kAudioProcessPropertyIsRunningOutput, initial: UInt32(0)) ?? 0) != 0
+            }
+        }
+        silentWhileMusicPlays = musicPlaying ? silentWhileMusicPlays + 1 : 0
+        if silentWhileMusicPlays >= 3 {   // 6 s
+            if captureHint == nil {
+                Log.health.error("system tap silent for 6 s while Apple Music is playing")
+                captureHint = "Apple Music is playing, but the system tap hears nothing. With AirPods, Dolby Atmos tracks play "
+                    + "through head-tracked Spatial Audio, which bypasses the tap. Set Music → Settings → Playback → "
+                    + "Dolby Atmos to Off while using a stereo BRIR."
+            }
+        } else if silentWhileMusicPlays == 0, captureHint != nil {
+            captureHint = nil
+        }
+    }
+
+    private let ticksToSeconds: Double = {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        return Double(tb.numer) / Double(tb.denom) * 1e-9
+    }()
 
     /// Summarise which channels carried signal in the last few seconds, and what format that implies.
     private func updateReceivingSummary() {
@@ -532,7 +611,8 @@ final class AppState: ObservableObject {
                     if let cur = CA.defaultOutputDevice(), cur != self.virtualDeviceID { self.reclaimDefaultOutput(newDevice: cur) }
                     return
                 }
-                if self.outputUID == AppState.systemDefaultUID { self.scheduleRestart() }
+                Log.system.notice("default output → \(CA.defaultOutputDevice().flatMap(CA.deviceName) ?? "none", privacy: .public)")
+                if self.outputUID == AppState.systemDefaultUID { self.scheduleRestart("default output changed") }
             }
         }
         CA.listen(CA.system, kAudioHardwarePropertyDevices) { [weak self] in
@@ -540,9 +620,10 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 let hadSurroundDevice = self.virtualDeviceID != nil
                 self.refreshDevices()
-                if hadSurroundDevice != (self.virtualDeviceID != nil) { self.scheduleRestart(); return }
+                Log.system.notice("device list changed")
+                if hadSurroundDevice != (self.virtualDeviceID != nil) { self.scheduleRestart("surround device appeared/disappeared"); return }
                 if self.running, let uid = self.resolvedOutputUID, CA.device(forUID: uid) != self.observedDevice {
-                    self.scheduleRestart()
+                    self.scheduleRestart("output device changed in the device list")
                 }
             }
         }
@@ -551,7 +632,8 @@ final class AppState: ObservableObject {
                 guard let self, self.running else { return }
                 self.checkForFeedbackLoop()
                 guard self.usingSystemTap else { return }
-                if self.computeExclusions().ids != self.currentExclusions { self.scheduleRestart() }
+                Log.system.info("audio process list changed")
+                if self.computeExclusions().ids != self.currentExclusions { self.scheduleRestart("excluded processes changed") }
             }
         }
     }
@@ -560,10 +642,11 @@ final class AppState: ObservableObject {
 
     // MARK: Lifecycle
 
-    private func restartIfRunning() { if enabled { scheduleRestart() } }
+    private func restartIfRunning(_ reason: String = "setting changed") { if enabled { scheduleRestart(reason) } }
 
-    private func scheduleRestart() {
+    private func scheduleRestart(_ reason: String = "unspecified") {
         guard enabled else { return }
+        Log.pipeline.notice("restart requested: \(reason, privacy: .public)")
         restartWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
             Task { @MainActor in self?.start() }
@@ -574,6 +657,7 @@ final class AppState: ObservableObject {
 
     func start() {
         guard !restarting else { return }
+        Log.pipeline.notice("start (BRIR \(self.sourceIR?.format ?? "none", privacy: .public), partition \(self.blockSize))")
         restarting = true
         defer { restarting = false }
         stop(keepEnabled: true)
@@ -589,7 +673,7 @@ final class AppState: ObservableObject {
         // Never tap ourselves: that would feed our own output back into the convolver.
         guard CA.processObject(forPID: getpid()) != nil else {
             status = "Waiting for Core Audio…"
-            scheduleRestart()
+            scheduleRestart("own process object not available yet")
             return
         }
         // Reading an input device (the surround device or another loopback) counts as microphone access.
@@ -600,7 +684,7 @@ final class AppState: ObservableObject {
             case .notDetermined:
                 status = "Waiting for microphone permission…"
                 AVCaptureDevice.requestAccess(for: .audio) { _ in
-                    Task { @MainActor in AppState.shared.scheduleRestart() }
+                    Task { @MainActor in AppState.shared.scheduleRestart("microphone permission answered") }
                 }
                 return
             default:
@@ -640,6 +724,9 @@ final class AppState: ObservableObject {
             if !surroundSuspended { lastError = nil }
             let resampled = sourceIR.map { $0.sampleRate != rate } ?? false
             status = "Running → \(p.outputName)"
+            failedStarts = 0
+            Log.pipeline.notice("running at \(Int(rate)) Hz, \(conv.sourceCount) sources × \(conv.partitions) partitions")
+            healthPrev = nil
             let latencyMs = Double(blockSize) / rate * 1000
             detail = "\(Int(rate)) Hz · \(p.inputDescription) · \(conv.sourceCount) virtual speakers · "
                 + "\(conv.partitions) partitions × \(blockSize) · +\(String(format: "%.1f", latencyMs)) ms · IO \(p.ioBufferFrames) frames"
@@ -649,10 +736,23 @@ final class AppState: ObservableObject {
             running = false
             lastError = error.localizedDescription
             status = "Error"
+            Log.pipeline.error("start failed: \(error.localizedDescription, privacy: .public)")
+            // Often transient (a permission prompt still open, Core Audio reconfiguring after a device change):
+            // retry after 1, 2, 4 … up to 15 s rather than staying silent until something else changes.
+            failedStarts += 1
+            let delay = min(15.0, pow(2, Double(failedStarts - 1)))
+            status = String(format: "Error — retrying in %.0f s", delay)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                Task { @MainActor in
+                    guard let self, self.enabled, !self.running else { return }
+                    self.scheduleRestart("retry after a failed start (attempt \(self.failedStarts + 1))")
+                }
+            }
         }
     }
 
     func stop(keepEnabled: Bool = false) {
+        if pipeline != nil { Log.pipeline.notice("stop") }
         pipeline?.stop()
         pipeline = nil
         if let l = rateListener, observedDevice != 0 {
@@ -670,7 +770,9 @@ final class AppState: ObservableObject {
 
     private func observeRate(of dev: AudioObjectID) {
         rateListener = CA.listen(dev, kAudioDevicePropertyNominalSampleRate) { [weak self] in
-            Task { @MainActor in self?.scheduleRestart() }
+            let r = CA.nominalSampleRate(dev).map { String(Int($0)) } ?? "?"
+            Log.system.notice("output device sample rate changed → \(r, privacy: .public) Hz")
+            Task { @MainActor in self?.scheduleRestart("output sample rate changed to \(r) Hz") }
         }
     }
 
@@ -703,6 +805,7 @@ final class AppState: ObservableObject {
         m.starved = p.starvedCallbacks
         updateTestState(c)
         meterTicks += 1
+        if meterTicks % 30 == 0 { logHealth(p) }   // every 2 s
         if meterTicks % 30 == 0 { checkForFeedbackLoop() }   // every 2 s
         let g = c.gainDB
         if abs(g - preampDB) > 0.001 { preampDB = min(0, g) }
@@ -734,12 +837,21 @@ final class AppState: ObservableObject {
 
     // MARK: Launch at login
 
+    /// Cached: asking SMAppService is an XPC round trip, and SwiftUI reads this on every redraw
+    /// (15× a second while the meters move). Refreshed when the window appears and after changes.
+    @Published private(set) var launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+
+    func refreshLaunchAtLogin() {
+        let on = SMAppService.mainApp.status == .enabled
+        if on != launchAtLoginEnabled { launchAtLoginEnabled = on }
+    }
+
     var launchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
+        get { launchAtLoginEnabled }
         set {
             do { newValue ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister() }
             catch { lastError = "Launch at login: \(error.localizedDescription)" }
-            objectWillChange.send()
+            refreshLaunchAtLogin()
         }
     }
 }
