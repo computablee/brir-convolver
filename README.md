@@ -208,6 +208,14 @@ level difference, and the first reflections.
 - **Silence after enabling:** check the System Audio Recording permission (step 3) and that the
   *In* meter moves while something plays. With a loopback capture device, check that it is the macOS output
   and that BRIR Convolver's Output is a different device.
+- **Wobbling pitch or silence with AirPods and Apple Music (stereo BRIR):** turn Music → Settings → Playback →
+  Dolby Atmos **Off**. With AirPods, Atmos tracks play through head-tracked Spatial Audio. That path bypasses the
+  system tap, so you hear silence, and each time it switches on or off the Bluetooth link briefly runs at 0.9–1.1×
+  speed, which drift compensation turns into pitch wobble. The app warns about the silent case in Status. With a
+  surround BRIR and the surround device, use Dolby Atmos **Automatic** instead (see Surround).
+- **Collecting logs:** after reproducing a problem, run `bash collect-logs.sh 5`. It gathers the app's log
+  (subsystem `com.phil.brirconvolver`), the driver's, Core Audio's, recent crash reports and the device list into
+  `logs/<time>/`.
 - **No sound after a crash** while surround was active: the macOS output is still BRIR Convolver Surround. Relaunch
   the app (it restores the output), or pick your usual output in Sound settings.
 - **Clicks or dropouts:** raise the partition size, or try turning off *Drift compensation*.
