@@ -11,10 +11,20 @@ echo "Compiling…"
 xcrun swiftc -O -wmo -parse-as-library -swift-version 5 \
     -target arm64-apple-macos14.4 \
     -framework CoreAudio -framework AudioToolbox -framework Accelerate \
-    -framework AppKit -framework SwiftUI -framework ServiceManagement \
+    -framework AppKit -framework SwiftUI -framework ServiceManagement -framework AVFoundation \
     Sources/*.swift -o "$APP/Contents/MacOS/BRIRConvolver"
 
 cp Info.plist "$APP/Contents/Info.plist"
+
+# Virtual surround audio device (AudioServerPlugIn), shipped inside the app and installed from it.
+echo "Compiling surround device driver…"
+DRV="$APP/Contents/Resources/BRIRConvolverSurround.driver"
+mkdir -p "$DRV/Contents/MacOS"
+xcrun clang -O2 -Wall -Wextra -bundle -target arm64-apple-macos14.4 \
+    -framework CoreAudio -framework CoreFoundation \
+    Driver/BRIRConvolverDevice.c -o "$DRV/Contents/MacOS/BRIRConvolverSurround"
+cp Driver/Info.plist "$DRV/Contents/Info.plist"
+codesign --force --sign - --timestamp=none "$DRV" >/dev/null
 
 # App icon: any square-ish Icon.png / Icon.jpg next to this script becomes the .icns
 ICON_SRC=""
@@ -37,6 +47,10 @@ echo "Built: $(pwd)/$APP"
 if [[ "${1:-}" == "--test" ]]; then
     # Optional second argument: a BRIR WAV to test with. Without it a synthetic BRIR is used.
     "$APP/Contents/MacOS/BRIRConvolver" --selftest "${2:-}"
+    echo "Driver test…"
+    xcrun clang -O1 -Wall -target arm64-apple-macos14.4 -framework CoreAudio -framework CoreFoundation \
+        Driver/DriverTest.c -o build/DriverTest
+    build/DriverTest "$DRV"
 fi
 if [[ "${1:-}" == "--install" ]]; then
     rm -rf "/Applications/BRIR Convolver.app"

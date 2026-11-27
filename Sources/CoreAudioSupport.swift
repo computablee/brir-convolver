@@ -8,6 +8,7 @@ struct AudioDeviceInfo: Identifiable, Hashable {
     let uid: String
     let name: String
     let outputChannels: Int
+    var inputChannels: Int = 0
 }
 
 struct AudioProcessInfo: Hashable {
@@ -45,7 +46,8 @@ enum CA {
         AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
     }
 
-    static func get<T>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+    /// Read a fixed-size property. `T` must be a plain value type: Core Audio writes raw bytes into it.
+    static func get<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, initial: T) -> T? {
         var addr = address(selector, scope)
         var value = initial
@@ -54,7 +56,8 @@ enum CA {
         return st == noErr ? value : nil
     }
 
-    static func getArray<T>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+    /// Read an array property. `T` must be a plain value type: Core Audio writes raw bytes into it.
+    static func getArray<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                             scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, zero: T) -> [T] {
         var addr = address(selector, scope)
         var size: UInt32 = 0
@@ -79,6 +82,13 @@ enum CA {
     static func defaultOutputDevice() -> AudioObjectID? {
         guard let d = get(system, kAudioHardwarePropertyDefaultOutputDevice, initial: AudioObjectID(0)), d != 0 else { return nil }
         return d
+    }
+
+    @discardableResult
+    static func setDefaultOutputDevice(_ dev: AudioObjectID) -> Bool {
+        var addr = address(kAudioHardwarePropertyDefaultOutputDevice)
+        var d = dev
+        return AudioObjectSetPropertyData(system, &addr, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &d) == noErr
     }
 
     static func deviceUID(_ dev: AudioObjectID) -> String? { getString(dev, kAudioDevicePropertyDeviceUID) }
@@ -112,6 +122,102 @@ enum CA {
         }
     }
 
+    /// Devices with input channels (e.g. a loopback driver such as BlackHole), excluding our own aggregates.
+    static func inputDevices() -> [AudioDeviceInfo] {
+        let ids = getArray(system, kAudioHardwarePropertyDevices, zero: AudioObjectID(0))
+        return ids.compactMap { id in
+            let ch = channelCount(id, scope: kAudioObjectPropertyScopeInput)
+            guard ch > 0, let uid = deviceUID(id), !uid.hasPrefix(AudioPipeline.aggregateUIDPrefix) else { return nil }
+            return AudioDeviceInfo(id: id, uid: uid, name: deviceName(id) ?? uid,
+                                   outputChannels: channelCount(id, scope: kAudioObjectPropertyScopeOutput), inputChannels: ch)
+        }
+    }
+
+    @discardableResult
+    static func setNominalSampleRate(_ dev: AudioObjectID, _ rate: Double) -> Bool {
+        if let cur = nominalSampleRate(dev), cur == rate { return true }
+        var addr = address(kAudioDevicePropertyNominalSampleRate)
+        var v = Float64(rate)
+        return AudioObjectSetPropertyData(dev, &addr, 0, nil, UInt32(MemoryLayout<Float64>.size), &v) == noErr
+    }
+
+    // MARK: Channel layouts
+
+    /// Channel labels of the device's speaker configuration (Audio MIDI Setup → Configure Speakers).
+    /// Tries the output scope first (where loopback drivers such as BlackHole keep it), then input.
+    static func speakerLabels(_ dev: AudioObjectID) -> [AudioChannelLabel]? {
+        for scope in [kAudioObjectPropertyScopeOutput, kAudioObjectPropertyScopeInput] {
+            var addr = address(kAudioDevicePropertyPreferredChannelLayout, scope)
+            var size: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(dev, &addr, 0, nil, &size) == noErr,
+                  Int(size) >= MemoryLayout<AudioChannelLayout>.size else { continue }
+            let raw = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+            defer { raw.deallocate() }
+            guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, raw) == noErr else { continue }
+            if let l = labels(of: UnsafeRawPointer(raw), depth: 0), !l.isEmpty { return l }
+        }
+        return nil
+    }
+
+    /// Labels of an `AudioChannelLayout` in memory, expanding layout tags and bitmaps.
+    static func labels(of raw: UnsafeRawPointer, depth: Int) -> [AudioChannelLabel]? {
+        let layout = raw.assumingMemoryBound(to: AudioChannelLayout.self).pointee
+        let n = Int(layout.mNumberChannelDescriptions)
+        if n > 0 {
+            let off = MemoryLayout<AudioChannelLayout>.offset(of: \AudioChannelLayout.mChannelDescriptions) ?? 12
+            let d = (raw + off).assumingMemoryBound(to: AudioChannelDescription.self)
+            return (0..<n).map { d[$0].mChannelLabel }
+        }
+        guard depth == 0 else { return nil }
+        let tag = layout.mChannelLayoutTag
+        var spec: UInt32
+        let prop: AudioFormatPropertyID
+        if tag == kAudioChannelLayoutTag_UseChannelBitmap {
+            spec = layout.mChannelBitmap.rawValue
+            prop = kAudioFormatProperty_ChannelLayoutForBitmap
+        } else if tag != kAudioChannelLayoutTag_UseChannelDescriptions {
+            spec = tag
+            prop = kAudioFormatProperty_ChannelLayoutForTag
+        } else {
+            return nil
+        }
+        var size: UInt32 = 0
+        let specSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioFormatGetPropertyInfo(prop, specSize, &spec, &size) == noErr, size > 0 else { return nil }
+        let out = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: 16)
+        defer { out.deallocate() }
+        guard AudioFormatGetProperty(prop, specSize, &spec, &size, out) == noErr else { return nil }
+        return labels(of: UnsafeRawPointer(out), depth: depth + 1)
+    }
+
+    /// Map Core Audio channel labels to the roles the convolver understands. Returns nil if no label
+    /// names a known speaker (e.g. a device that only reports discrete/unknown channels).
+    static func roles(for labels: [AudioChannelLabel]) -> [InputRole]? {
+        // Numeric label values from CoreAudioBaseTypes.h.
+        let hasSideDirect = labels.contains(10) || labels.contains(11)
+        let r: [InputRole] = labels.map { l in
+            switch l {
+            case 1: return .speaker(.FL)            // Left
+            case 2: return .speaker(.FR)            // Right
+            case 3, 42: return .speaker(.FC)        // Center, Mono
+            case 4, 37: return .speaker(.LFE)       // LFEScreen, LFE2
+            case 5: return .speaker(hasSideDirect ? .BL : .SL)   // LeftSurround
+            case 6: return .speaker(hasSideDirect ? .BR : .SR)   // RightSurround
+            case 9: return .centerSurround          // CenterSurround
+            case 10: return .speaker(.SL)           // LeftSurroundDirect
+            case 11: return .speaker(.SR)           // RightSurroundDirect
+            case 33: return .speaker(.BL)           // RearSurroundLeft
+            case 34: return .speaker(.BR)           // RearSurroundRight
+            case 13, 49: return .speaker(.TFL)      // LeftTopFront (VerticalHeightLeft), LeftTopMiddle
+            case 15, 51: return .speaker(.TFR)      // RightTopFront (VerticalHeightRight), RightTopMiddle
+            case 16, 52: return .speaker(.TBL)      // TopBackLeft, LeftTopRear
+            case 18, 54: return .speaker(.TBR)      // TopBackRight, RightTopRear
+            default: return .unused
+            }
+        }
+        return r.contains(where: { $0 != .unused }) ? r : nil
+    }
+
     static func device(forUID uid: String) -> AudioObjectID? {
         getArray(system, kAudioHardwarePropertyDevices, zero: AudioObjectID(0)).first { deviceUID($0) == uid }
     }
@@ -125,6 +231,11 @@ enum CA {
                                     bundleID: getString(obj, kAudioProcessPropertyBundleID) ?? "",
                                     path: executablePath(pid))
         }
+    }
+
+    /// Devices a process is currently playing to.
+    static func processOutputDevices(_ proc: AudioObjectID) -> [AudioObjectID] {
+        getArray(proc, kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput, zero: AudioObjectID(0))
     }
 
     static func processObject(forPID pid: pid_t) -> AudioObjectID? {

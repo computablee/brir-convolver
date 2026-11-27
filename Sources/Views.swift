@@ -23,13 +23,10 @@ struct MainView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(state.irInfo).font(.callout).lineLimit(2)
                         if let e = state.irError { Text(e).font(.caption).foregroundStyle(.red) }
-                        else if let s = state.peakSafeDB {
-                            Text("Peak-safe preamp: \(s, specifier: "%.2f") dB").font(.caption).foregroundStyle(.secondary)
-                        }
                     }
                     Spacer()
                     Button("Analysis…") { openWindow(id: "viz") }
-                    Button("Choose WAV…") { ui.importing = true }
+                    Button("Choose WAV or folder…") { ui.importing = true }
                 }
                 .padding(8)
                 .background(RoundedRectangle(cornerRadius: 8)
@@ -41,14 +38,86 @@ struct MainView: View {
                     }
                     return true
                 }
-                Picker("Channel order", selection: $state.channelOrder) {
+                Picker("4-channel order", selection: $state.channelOrder) {
                     ForEach(ChannelOrder.allCases) { Text($0.label).tag($0) }
                 }
-            } header: { Text("Impulse response (drop a 4-channel true-stereo WAV here)") }
+                .disabled(state.irChannels != 4)
+                Picker("16-channel speaker order", selection: $state.multichannelMapping) {
+                    ForEach(SpeakerOrder.allCases) { Text($0.label).tag($0) }
+                }
+                .disabled(state.irChannels != 16)
+                if state.isDirectionalFolder {
+                    DisclosureGroup("Speaker positions (nearest exported direction is used)") {
+                        ForEach(Speaker.directional) { sp in
+                            SpeakerPositionRow(speaker: sp)
+                        }
+                        HStack {
+                            Text(state.chosenDirections.joined(separator: " · "))
+                                .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            Spacer()
+                            Button("Defaults") { state.resetPositions() }.controlSize(.small)
+                        }
+                    }
+                }
+            } header: {
+                Text("Impulse response (drop a true-stereo, HeSuVi 14-channel or ASH 16-channel WAV, or a folder of ASH directional BRIRs)")
+            }
+
+            Section("Input") {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Toggle("Use the BRIR Convolver Surround device for surround BRIRs", isOn: $state.useVirtualDevice)
+                        Text(state.virtualDeviceInstalled
+                             ? "Installed. While a surround BRIR is loaded it becomes the macOS output; picking another output "
+                               + "in macOS sends the convolved audio there instead (e.g. GraphWorks EQ)."
+                             : "Not installed. Installing asks for your password once and restarts Core Audio.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if state.virtualDeviceInstalled {
+                        Button("Uninstall…") { state.uninstallVirtualDevice() }
+                    }
+                    Button(state.virtualDeviceInstalled ? "Reinstall…" : "Install…") { state.installVirtualDevice() }
+                        .disabled(!VirtualDevice.isBundled)
+                }
+                if state.surroundSuspended {
+                    HStack {
+                        Text("Surround device paused (see the message under Status).").font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Re-enable") { state.resumeSurround() }.controlSize(.small)
+                    }
+                }
+                Picker("Capture", selection: $state.inputUID) {
+                    Text("System audio (stereo tap of all apps)").tag("")
+                    ForEach(state.inputDevices) { d in Text("\(d.name) (\(d.inputChannels) ch)").tag(d.uid) }
+                }
+                Picker("Channel layout", selection: $state.inputLayout) {
+                    Text("Automatic (device's speaker configuration)").tag(SpeakerOrder?.none)
+                    ForEach(SpeakerOrder.allCases) { Text($0.rawValue).tag(SpeakerOrder?.some($0)) }
+                }
+                .disabled(state.usingSystemTap || state.wantsSurround)
+                Picker("LFE level", selection: $state.lfeGainDB) {
+                    ForEach(AppState.lfeChoices, id: \.self) { v in
+                        Text(v.map { String(format: "%+.0f dB", $0) } ?? "Off").tag(v)
+                    }
+                }
+                .disabled(state.usingSystemTap)
+                Text(state.wantsSurround
+                     ? "Capturing 7.1.4 from \(VirtualDevice.name) (automatic while a surround BRIR is loaded)."
+                     : state.usingSystemTap
+                     ? "Stereo only: the front speaker pair of a surround BRIR is used. Load a surround BRIR with the "
+                       + "surround device installed, or capture from another multichannel loopback device."
+                     : "Apps play into this device and BRIR Convolver plays the result to the Output below, which must be a "
+                       + "different device (your DAC or GraphWorks EQ, not the system default).")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !state.routingInfo.isEmpty {
+                    Text(state.routingInfo).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
 
             Section("Processing") {
                 Toggle("Enable system-wide convolution", isOn: $state.enabled)
-                Toggle("Bypass (bit-exact passthrough, no preamp)", isOn: $state.bypass)
+                Toggle("Bypass (passthrough, no preamp; multichannel input is downmixed to stereo)", isOn: $state.bypass)
                     .disabled(!state.enabled)
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -65,14 +134,38 @@ struct MainView: View {
                     .disabled(!state.running || state.bypass)
                 }
                 HStack {
-                    Text("Preamp")
-                    Slider(value: $state.preampDB, in: -30...12, step: 0.1).disabled(state.autoPreamp)
-                    TextField("", value: $state.preampDB, format: .number.precision(.fractionLength(1)))
-                        .frame(width: 56).multilineTextAlignment(.trailing).disabled(state.autoPreamp)
-                    Text("dB").foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Preamp (adaptive)")
+                        Text("Starts at 0 dB and drops only as far as needed to keep the output below 0 dBFS. "
+                             + "It never rises on its own; reset it after something loud."
+                             + (state.preampReductions > 0 ? " Lowered \(state.preampReductions)× since the last reset." : ""))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(String(format: "%.2f dB", state.preampDB)).monospacedDigit()
+                    Button("Reset to 0 dB") { state.resetPreamp() }
+                        .disabled(state.preampDB == 0)
                 }
-                Toggle("Auto preamp (peak-safe: no frequency boosted above 0 dB)", isOn: $state.autoPreamp)
-                Toggle("Safety limiter above −1 dBFS (off = purely linear)", isOn: $state.limiter)
+            }
+
+            Section("Surround test") {
+                HStack {
+                    Picker("Sound", selection: $state.testSound) {
+                        ForEach(state.availableTestSounds, id: \.self) { Text($0).tag($0) }
+                    }
+                    .frame(maxWidth: 220)
+                    Spacer()
+                    if state.testPlaying {
+                        Text(state.testSpeaker?.name ?? "Preparing…").monospacedDigit().foregroundStyle(.secondary)
+                        Button("Stop") { state.stopSurroundTest() }
+                    } else {
+                        Button("Play from each speaker") { state.runSurroundTest() }
+                            .disabled(!state.running || state.bypass)
+                    }
+                }
+                Text("Plays the sound from each virtual speaker in turn (front left, centre, front right, around the back, "
+                     + "then the heights), through the BRIR and preamp. Other audio is muted while it plays.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Output") {
@@ -81,7 +174,9 @@ struct MainView: View {
                     ForEach(state.devices) { d in Text(d.name).tag(d.uid) }
                 }
                 Text("For GraphWorks EQ: leave GraphWorks EQ as the macOS output (or pick it here). "
-                     + "This app feeds GraphWorks EQ, which applies your headphone EQ last.")
+                     + "This app feeds GraphWorks EQ, which applies your headphone EQ last. While the surround device is "
+                     + "the macOS output, “System default” means the device it replaced. Set GraphWorks EQ's own output "
+                     + "to your DAC rather than System Default.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -111,34 +206,50 @@ struct MainView: View {
                     Text(String(format: "Delay: I/O %.1f ms + partition %.1f ms = %.1f ms added · output device reports %.1f ms",
                                 m.ioMs, m.partitionMs, m.addedDelayMs, m.downstreamMs))
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %d-frame callback, against a %.2f ms deadline (%.0f× headroom at peak).",
-                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0))
+                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %d-frame callback, against a %.2f ms deadline (%.0f× headroom at peak). %llu callbacks, %llu with missing input.",
+                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0,
+                                m.callbacks, m.starved))
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
                 if let e = state.lastError { Text(e).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
                 if state.running {
-                    MeterRow(label: "In", l: state.meters.inL, r: state.meters.inR)
-                    MeterRow(label: "Out", l: state.meters.outL, r: state.meters.outR)
+                    ChannelMeters(title: "In — click and hold a channel to hear only that channel",
+                                  labels: state.inputLabels, levels: state.meters.inputs,
+                                  solo: state.soloChannel, onSolo: { state.soloChannel = $0 })
+                    if !state.receivingSummary.isEmpty {
+                        Text(state.receivingSummary + "  (channels above −70 dBFS in the last 20 s)")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ChannelMeters(title: "Out", labels: ["L", "R"], levels: [state.meters.outL, state.meters.outR])
+                    if let hint = state.captureHint {
+                        Text("⚠︎ " + hint).font(.caption).foregroundStyle(.orange)
+                    }
+                    if state.meters.nonFiniteInput > 0 {
+                        Text("⚠︎ \(state.meters.nonFiniteInput) input samples were NaN/infinite and were replaced with silence.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
                     if state.meters.clips > 0 {
                         HStack {
-                            Text("⚠︎ \(state.meters.clips) samples over 0 dBFS — lower the preamp")
+                            Text("⚠︎ \(state.meters.clips) samples over 0 dBFS (bypass / A/B passthrough)")
                                 .font(.caption).foregroundStyle(.orange)
                             Spacer()
                             Button("Reset") { state.resetClips() }.controlSize(.small)
                         }
                     }
                 }
-                Text(state.excludedNames.isEmpty
-                     ? "Not tapping: this app. (GraphWorks EQ not detected.)"
-                     : "Not tapping: this app, \(state.excludedNames.joined(separator: ", "))")
-                    .font(.caption).foregroundStyle(.secondary)
+                if state.usingSystemTap {
+                    Text(state.excludedNames.isEmpty
+                         ? "Not tapping: this app. (GraphWorks EQ not detected.)"
+                         : "Not tapping: this app, \(state.excludedNames.joined(separator: ", "))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             Section("Advanced") {
                 Picker("Partition size (latency vs. CPU)", selection: $state.blockSize) {
                     ForEach([64, 128, 256, 512, 1024, 2048], id: \.self) { Text("\($0) samples").tag($0) }
                 }
-                Toggle("Tap drift compensation", isOn: $state.driftCompensation)
+                Toggle("Drift compensation (tap or capture device)", isOn: $state.driftCompensation)
                 HStack {
                     TextField("Also never tap (comma-separated bundle IDs / names)", text: $state.extraExclusions)
                     Button("Apply") { state.applyExclusionChanges() }
@@ -147,10 +258,33 @@ struct MainView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { state.refreshLaunchAtLogin() }
         .frame(minWidth: 560, idealWidth: 620, minHeight: 640)
-        .fileImporter(isPresented: $ui.importing, allowedContentTypes: [.wav, .audio]) { result in
+        .fileImporter(isPresented: $ui.importing, allowedContentTypes: [.wav, .audio, .folder]) { result in
             if case .success(let url) = result { state.loadIR(url: url) }
         }
+    }
+}
+
+/// Elevation/azimuth steppers for one speaker of a directional BRIR folder.
+struct SpeakerPositionRow: View {
+    @ObservedObject var state = AppState.shared
+    let speaker: Speaker
+    var body: some View {
+        let d = state.position(speaker)
+        HStack {
+            Text(speaker.name).frame(width: 120, alignment: .leading)
+            Spacer()
+            Stepper("Elevation \(d.elevation)°", value: Binding(
+                get: { d.elevation },
+                set: { state.setPosition(speaker, Direction(elevation: $0, azimuth: d.azimuth)) }), in: -90...90, step: 5)
+                .monospacedDigit()
+            Stepper("Azimuth \(d.azimuth)°", value: Binding(
+                get: { d.azimuth },
+                set: { state.setPosition(speaker, Direction(elevation: d.elevation, azimuth: $0)) }), in: -180...180, step: 5)
+                .monospacedDigit()
+        }
+        .font(.callout)
     }
 }
 
@@ -170,16 +304,55 @@ struct HoldButtonStyle: ButtonStyle {
     }
 }
 
-struct MeterRow: View {
-    let label: String
-    let l: Double
-    let r: Double
+/// One labelled bar per channel, under a title. With `onSolo`, pressing and holding a row solos that channel.
+struct ChannelMeters: View {
+    let title: String
+    let labels: [String]
+    let levels: [Double]
+    var solo: Int? = nil
+    var onSolo: ((Int?) -> Void)? = nil
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(label).font(.caption).frame(width: 28, alignment: .leading)
-            VStack(spacing: 3) { MeterBar(db: l); MeterBar(db: r) }
-            Text(String(format: "%5.1f", max(l, r))).font(.caption.monospacedDigit()).frame(width: 44, alignment: .trailing)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold))
+            ForEach(Array(levels.enumerated()), id: \.offset) { i, db in
+                if let onSolo {
+                    Button(action: {}) { row(i, db) }
+                        .buttonStyle(PressReportingStyle(highlighted: solo == i) { onSolo($0 ? i : nil) })
+                        .help("Hold to hear only \(label(i))")
+                } else {
+                    row(i, db)
+                }
+            }
         }
+    }
+
+    private func label(_ i: Int) -> String { i < labels.count ? labels[i] : "\(i + 1)" }
+
+    private func row(_ i: Int, _ db: Double) -> some View {
+        HStack(spacing: 8) {
+            Text(label(i))
+                .font(.caption2.monospaced())
+                .foregroundStyle(db > -70 ? Color.primary : Color.secondary)
+                .frame(width: 30, alignment: .leading)
+            MeterBar(db: db)
+            Text(db <= -119.9 ? "—" : String(format: "%5.1f", db))
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 4).padding(.vertical, 1)
+        .contentShape(Rectangle())
+    }
+}
+
+/// Reports press and release of a plain-looking button (for hold-to-solo rows).
+struct PressReportingStyle: ButtonStyle {
+    let highlighted: Bool
+    let onChange: (Bool) -> Void
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(RoundedRectangle(cornerRadius: 4).fill(highlighted ? Color.accentColor.opacity(0.25) : .clear))
+            .onChange(of: configuration.isPressed) { _, pressed in onChange(pressed) }
     }
 }
 

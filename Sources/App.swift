@@ -9,6 +9,9 @@ enum Entry {
             let path = i + 1 < args.count ? args[i + 1] : ""
             exit(SelfTest.run(wavPath: path) ? 0 : 1)
         }
+        if args.contains("--diagnose") {
+            exit(Diagnose.run(args: args) ? 0 : 1)
+        }
         BRIRConvolverApp.main()
     }
 }
@@ -19,7 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationWillTerminate(_ notification: Notification) {
         // Tear down the tap so other apps are unmuted immediately.
-        MainActor.assumeIsolated { AppState.shared.stop(keepEnabled: true) }
+        MainActor.assumeIsolated { AppState.shared.prepareForQuit() }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
