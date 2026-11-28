@@ -312,6 +312,10 @@ final class HeadTrackingController: ObservableObject {
         if enabled { cameras = HeadTracker.cameras() }
     }
 
+    /// Straight ahead has been set with the camera that's selected now (a reading from another camera's position
+    /// would be off by however the cameras differ, so it isn't used).
+    var calibrated: Bool { calibration?.cameraID == cameraID }
+
     // MARK: Toggle
 
     func setEnabled(_ on: Bool) {
@@ -339,7 +343,7 @@ final class HeadTrackingController: ObservableObject {
         defaults.set(true, forKey: Self.enabledKey)
         cameras = HeadTracker.cameras()
         Log.system.notice("head tracking on")
-        if calibration == nil || calibration?.cameraID != cameraID { beginCalibration() } else { updateCamera() }
+        if calibrated { updateCamera() } else { beginCalibration() }
     }
 
     private func turnOff() {
@@ -359,8 +363,19 @@ final class HeadTrackingController: ObservableObject {
             tracker.stop()
             cameraRunning = false
         }
-        // A calibration belongs to one camera position.
-        if enabled && calibration?.cameraID != cameraID && !calibrationVisible { beginCalibration() } else { updateCamera() }
+        if calibrationVisible {
+            // Switched from inside the sheet: start over with the new camera (it restarts below).
+            stopTimer()
+            calibrationPhase = .ready
+            calibrationProblem = nil
+        } else if enabled && !calibrated {
+            // Straight ahead belongs to one camera position.
+            beginCalibration()
+            return
+        }
+        pose = .forward
+        updateCamera()
+        retarget()
     }
 
     // MARK: Convolver
@@ -400,7 +415,7 @@ final class HeadTrackingController: ObservableObject {
     /// Choose each speaker's file for the current pose and swap any that changed.
     private func retarget() {
         guard let conv, let index else { return }
-        let active = enabled && calibration != nil && !calibrationVisible
+        let active = enabled && calibrated && !calibrationVisible
         let head = active ? pose : .forward
         for i in tracked.indices {
             let target: Direction
@@ -456,7 +471,7 @@ final class HeadTrackingController: ObservableObject {
     // MARK: Camera
 
     private func updateCamera() {
-        let want = calibrationVisible || (enabled && calibration != nil && attached)
+        let want = calibrationVisible || (enabled && calibrated && attached)
         if want && !cameraRunning {
             guard HeadTracker.authorization == .authorized else {
                 message = "BRIR Convolver doesn't have camera access. Allow it under System Settings → Privacy & Security → Camera."
@@ -488,7 +503,7 @@ final class HeadTrackingController: ObservableObject {
             if calibrationPhase == .capturing, let r { samples.append(r) }
             return
         }
-        guard enabled, let cal = calibration else { return }
+        guard enabled, calibrated, let cal = calibration else { return }
         let dt = max(0, min(0.5, now - lastPoseTime))
         lastPoseTime = now
         let target: HeadPose, tau: Double
@@ -512,6 +527,8 @@ final class HeadTrackingController: ObservableObject {
 
     /// Show the "face forward" sheet (first use, or after switching cameras).
     func beginCalibration() {
+        message = nil
+        cameras = HeadTracker.cameras()
         calibrationVisible = true
         calibrationPhase = .ready
         calibrationProblem = nil
@@ -604,15 +621,16 @@ final class HeadTrackingController: ObservableObject {
         retarget()
     }
 
-    /// Cancel, or the sheet was dismissed. Without a usable calibration, head tracking turns back off.
+    /// Cancel, or the sheet was dismissed. Head tracking stays on (so the camera can still be changed); without
+    /// straight ahead for the selected camera it's paused with the speakers facing forward until it's set.
     func cancelCalibration() {
         guard calibrationVisible else { return }
         closeCalibration()
-        if enabled && (calibration == nil || calibration?.cameraID != cameraID) {
-            enabled = false
-            defaults.set(false, forKey: Self.enabledKey)
-            message = "Head tracking needs to know where straight ahead is for this camera. Turn it on again to set it."
+        if enabled && !calibrated {
+            message = "Paused: straight ahead isn't set for this camera. Pick a camera that can see you, then press "
+                + "Set straight ahead…"
         }
+        pose = .forward
         updateCamera()
         retarget()
     }

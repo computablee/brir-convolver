@@ -410,9 +410,13 @@ struct HeadTrackingSection: View {
                 }
                 Spacer()
                 if ht.enabled {
-                    Button("Recenter") { ht.recenter() }
-                        .disabled(!ht.faceVisible)
-                        .help("Make the direction you're looking right now straight ahead.")
+                    if ht.calibrated {
+                        Button("Recenter") { ht.recenter() }
+                            .disabled(!ht.faceVisible)
+                            .help("Make the direction you're looking right now straight ahead.")
+                    } else {
+                        Button("Set straight ahead…") { ht.beginCalibration() }
+                    }
                 }
             }
             if ht.enabled {
@@ -462,7 +466,8 @@ struct HeadTrackingSection: View {
     }
 
     private var status: String {
-        if !ht.cameraRunning { return ht.calibration == nil ? "Straight ahead not set yet" : "Camera off" }
+        if !ht.calibrated { return "Paused: straight ahead isn't set for this camera" }
+        if !ht.cameraRunning { return "Camera off" }
         if ht.faceVisible { return "Tracking" }
         return "No face in view (holding the last position, then easing back to front)"
     }
@@ -482,6 +487,11 @@ struct CalibrationSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Set straight ahead").font(.title2.weight(.semibold))
+            Picker("Camera", selection: $ht.cameraID) {
+                Text("Default camera").tag("")
+                ForEach(ht.cameras) { Text($0.name).tag($0.id) }
+            }
+            .disabled(ht.calibrationPhase == .countdown || ht.calibrationPhase == .capturing)
             switch ht.calibrationPhase {
             case .ready:
                 Text("Sit where you normally listen and look straight ahead, wherever the centre speaker should be. "
@@ -492,7 +502,8 @@ struct CalibrationSheet: View {
                 Text(ht.calibrationPhase == .countdown ? "\(ht.countdown)" : "Hold still…")
                     .font(.system(size: 40, weight: .light)).monospacedDigit()
             case .failed:
-                Text(ht.calibrationProblem ?? "That didn't work.").foregroundStyle(.orange)
+                Text((ht.calibrationProblem ?? "That didn't work.") + " If this camera can't see you, pick another above.")
+                    .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             case .done:
                 Text("Done. Turn your head and the speakers should stay where they are in the room. If they move the "
