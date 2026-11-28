@@ -20,48 +20,19 @@ struct RawPose: Codable, Equatable {
     var pitch: Double
 }
 
-/// Five-point calibration: Vision's readings while looking forward, and 45° left, right, up and down.
-/// Raw readings are mapped piecewise-linearly through these points (and extrapolated past them), which absorbs
-/// Vision's sign convention, the camera's position, and any asymmetry between the two sides.
+/// Where "straight ahead" is: Vision's reading while the listener faced forward. Head angles are Vision's change
+/// from it, with the signs turned into ASH's convention (Apple's headers: yaw is positive counterclockwise, which
+/// is taken to mean turning left; pitch is positive nodding down). Either sign can be reversed in the UI in case
+/// a camera reports the other way.
 struct HeadCalibration: Codable, Equatable {
     /// Camera the calibration was made with ("" = the default camera).
     var cameraID: String
-    var forward, left, right, up, down: RawPose
+    var forward: RawPose
 
-    static let angle = 45.0
-
-    func pose(_ r: RawPose) -> HeadPose {
-        HeadPose(yaw: max(-180, min(180, Self.segment(r.yaw, center: forward.yaw, neg: left.yaw, pos: right.yaw))),
-                 pitch: max(-90, min(90, Self.segment(r.pitch, center: forward.pitch, neg: down.pitch, pos: up.pitch))))
-    }
-
-    /// Map `x` linearly on each side of `center`: `center` → 0, `neg` → −45°, `pos` → +45°.
-    static func segment(_ x: Double, center: Double, neg: Double, pos: Double) -> Double {
-        let towardPos = (x - center) * (pos - center) >= 0
-        let span = (towardPos ? pos : neg) - center
-        guard abs(span) > 1e-9 else { return 0 }
-        return (x - center) / span * (towardPos ? angle : -angle)
-    }
-
-    /// Smallest raw change (degrees) between forward and a 45° turn that counts as a usable reading.
-    static let minimumSpan = 5.0
-
-    /// Why this calibration can't be used, or nil if it can.
-    var problem: String? {
-        func check(_ what: String, _ c: Double, _ a: Double, _ b: Double) -> String? {
-            if abs(a - c) < Self.minimumSpan || abs(b - c) < Self.minimumSpan {
-                return "Turning your head \(what) barely changed what the camera measured "
-                    + String(format: "(%.1f° and %.1f° from forward). ", a - c, b - c)
-                    + "Turn further, or move the camera so it faces you, and try again."
-            }
-            if (a - c) * (b - c) >= 0 {
-                return "Turning your head \(what) measured both directions on the same side of forward. Try again, "
-                    + "and make sure you go back past the middle between the two steps."
-            }
-            return nil
-        }
-        return check("left and right", forward.yaw, left.yaw, right.yaw)
-            ?? check("up and down", forward.pitch, down.pitch, up.pitch)
+    func pose(_ r: RawPose, reverseYaw: Bool = false, reversePitch: Bool = false) -> HeadPose {
+        let yaw = (reverseYaw ? 1.0 : -1.0) * (r.yaw - forward.yaw)
+        let pitch = (reversePitch ? 1.0 : -1.0) * (r.pitch - forward.pitch)
+        return HeadPose(yaw: max(-180, min(180, yaw)), pitch: max(-90, min(90, pitch)))
     }
 }
 
@@ -225,30 +196,8 @@ final class HeadTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
 
 // MARK: - Calibration steps
 
-enum CalibrationStep: Int, CaseIterable {
-    case forward, left, right, up, down
-    var instruction: String {
-        switch self {
-        case .forward: return "Look straight ahead — wherever the centre speaker should be."
-        case .left: return "Turn your head 45° to the left."
-        case .right: return "Turn your head 45° to the right."
-        case .up: return "Face forward, then tilt your head 45° up."
-        case .down: return "Face forward, then tilt your head 45° down."
-        }
-    }
-    var whereLooking: String {
-        switch self {
-        case .forward: return "straight ahead"
-        case .left: return "left"
-        case .right: return "right"
-        case .up: return "up"
-        case .down: return "down"
-        }
-    }
-}
-
 enum CalibrationPhase {
-    /// Explanation and a Start button.
+    /// "Face forward" and a Start button.
     case ready
     case countdown
     case capturing
@@ -258,13 +207,14 @@ enum CalibrationPhase {
 
 // MARK: - Controller
 
-/// Owns the toggle, camera, calibration and the mapping from head pose to directional BRIRs, and asks the running
+/// Owns the toggle, camera, the forward reference and the mapping from head pose to directional BRIRs, and asks the running
 /// convolver to swap each speaker's BRIR as the head turns.
 @MainActor
 final class HeadTrackingController: ObservableObject {
     static let shared = HeadTrackingController()
     private let defaults = UserDefaults.standard
     private static let enabledKey = "headTracking", cameraKey = "headTrackingCamera", calibrationKey = "headCalibration"
+    private static let reverseYawKey = "headTrackingReverseYaw", reversePitchKey = "headTrackingReversePitch"
 
     /// The user's toggle (persisted). Only ever on with camera access granted.
     @Published private(set) var enabled: Bool
@@ -292,8 +242,11 @@ final class HeadTrackingController: ObservableObject {
     @Published private(set) var trackedSummary = ""
     @Published private(set) var message: String?
 
+    /// Vision reports the opposite signs from the default assumption (persisted).
+    @Published var reverseYaw: Bool { didSet { defaults.set(reverseYaw, forKey: Self.reverseYawKey) } }
+    @Published var reversePitch: Bool { didSet { defaults.set(reversePitch, forKey: Self.reversePitchKey) } }
+
     @Published private(set) var calibrationVisible = false
-    @Published private(set) var calibrationStep = 0
     @Published private(set) var calibrationPhase = CalibrationPhase.ready
     @Published private(set) var countdown = 0
     @Published private(set) var calibrationProblem: String?
@@ -333,15 +286,18 @@ final class HeadTrackingController: ObservableObject {
     private var calibrationTimer: Timer?
     private var phaseDeadline = 0.0
     private var samples: [RawPose] = []
-    private var collected: [CalibrationStep: RawPose] = [:]
-    private var validationFailed = false
     static let countdownSeconds = 3.0, captureSeconds = 1.2
-    /// Face readings needed for one calibration step (about a third of the capture window).
+    /// Face readings needed for the forward capture (about a third of the capture window).
     static let minimumSamples = 6
+    /// Recent face readings (time, pose), for Recenter.
+    private var recent: [(Double, RawPose)] = []
+    static let recenterWindow = 0.5
 
     private init() {
         enabled = defaults.bool(forKey: Self.enabledKey)
         cameraID = defaults.string(forKey: Self.cameraKey) ?? ""
+        reverseYaw = defaults.bool(forKey: Self.reverseYawKey)
+        reversePitch = defaults.bool(forKey: Self.reversePitchKey)
         if let d = defaults.data(forKey: Self.calibrationKey) {
             calibration = try? JSONDecoder().decode(HeadCalibration.self, from: d)
         }
@@ -355,8 +311,6 @@ final class HeadTrackingController: ObservableObject {
         }
         if enabled { cameras = HeadTracker.cameras() }
     }
-
-    var currentStep: CalibrationStep { CalibrationStep.allCases[min(calibrationStep, CalibrationStep.allCases.count - 1)] }
 
     // MARK: Toggle
 
@@ -527,18 +481,20 @@ final class HeadTrackingController: ObservableObject {
     private func ingest(_ r: RawPose?) {
         raw = r
         if faceVisible != (r != nil) { faceVisible = r != nil }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let r { recent.append((now, r)) }
+        recent.removeAll { now - $0.0 > Self.recenterWindow }
         if calibrationVisible {
             if calibrationPhase == .capturing, let r { samples.append(r) }
             return
         }
         guard enabled, let cal = calibration else { return }
-        let now = ProcessInfo.processInfo.systemUptime
         let dt = max(0, min(0.5, now - lastPoseTime))
         lastPoseTime = now
         let target: HeadPose, tau: Double
         if let r {
             lastFaceTime = now
-            target = cal.pose(r)
+            target = cal.pose(r, reverseYaw: reverseYaw, reversePitch: reversePitch)
             tau = Self.followTau
         } else if now - lastFaceTime > Self.holdWhenLost {
             target = .forward
@@ -554,30 +510,17 @@ final class HeadTrackingController: ObservableObject {
 
     // MARK: Calibration
 
+    /// Show the "face forward" sheet (first use, or after switching cameras).
     func beginCalibration() {
         calibrationVisible = true
-        calibrationStep = 0
         calibrationPhase = .ready
         calibrationProblem = nil
-        collected = [:]
-        validationFailed = false
         updateCamera()
         retarget()   // hold the speakers still (facing forward) while calibrating
     }
 
-    /// Start button: run the steps.
+    /// Start (or Try again): count down, then capture.
     func startCalibration() {
-        calibrationStep = 0
-        collected = [:]
-        validationFailed = false
-        runStep()
-    }
-
-    func retryCalibration() {
-        if validationFailed { startCalibration() } else { runStep() }
-    }
-
-    private func runStep() {
         calibrationProblem = nil
         calibrationPhase = .countdown
         phaseDeadline = ProcessInfo.processInfo.systemUptime + Self.countdownSeconds
@@ -603,48 +546,49 @@ final class HeadTrackingController: ObservableObject {
                 phaseDeadline = now + Self.captureSeconds
             }
         case .capturing:
-            if now >= phaseDeadline { finishStep() }
+            if now >= phaseDeadline { finishCapture() }
         default:
             stopTimer()
         }
     }
 
-    private func finishStep() {
-        let step = currentStep
-        guard samples.count >= Self.minimumSamples else {
-            calibrationPhase = .failed
-            calibrationProblem = "The camera couldn't see your face while you were looking \(step.whereLooking). "
-                + "Make sure it can see you, then try this step again."
-            NSSound(named: NSSound.Name("Basso"))?.play()
-            stopTimer()
-            return
-        }
-        func median(_ v: [Double]) -> Double {
-            let s = v.sorted()
+    private static func median(_ v: [RawPose]) -> RawPose {
+        func m(_ x: [Double]) -> Double {
+            let s = x.sorted()
             return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
         }
-        collected[step] = RawPose(yaw: median(samples.map(\.yaw)), pitch: median(samples.map(\.pitch)))
-        NSSound(named: NSSound.Name("Tink"))?.play()
-        if calibrationStep + 1 < CalibrationStep.allCases.count {
-            calibrationStep += 1
-            runStep()
-            return
-        }
+        return RawPose(yaw: m(v.map(\.yaw)), pitch: m(v.map(\.pitch)))
+    }
+
+    private func finishCapture() {
         stopTimer()
-        guard let f = collected[.forward], let l = collected[.left], let r = collected[.right],
-              let u = collected[.up], let d = collected[.down] else { return }
-        let cal = HeadCalibration(cameraID: cameraID, forward: f, left: l, right: r, up: u, down: d)
-        if let problem = cal.problem {
-            validationFailed = true
+        guard samples.count >= Self.minimumSamples else {
             calibrationPhase = .failed
-            calibrationProblem = problem
+            calibrationProblem = "The camera couldn't see your face. Make sure it can see you, then try again."
             NSSound(named: NSSound.Name("Basso"))?.play()
             return
         }
+        setForward(Self.median(samples))
+        NSSound(named: NSSound.Name("Tink"))?.play()
+        calibrationPhase = .done
+    }
+
+    private func setForward(_ f: RawPose) {
+        let cal = HeadCalibration(cameraID: cameraID, forward: f)
         calibration = cal
         defaults.set(try? JSONEncoder().encode(cal), forKey: Self.calibrationKey)
-        calibrationPhase = .done
-        Log.system.notice("head tracking calibrated: \(String(describing: cal), privacy: .public)")
+        Log.system.notice("head tracking forward set: \(String(describing: cal), privacy: .public)")
+    }
+
+    /// Make the direction the listener is looking right now (the last half second) straight ahead.
+    func recenter() {
+        guard recent.count >= 3 else {
+            message = "Can't recenter: the camera can't see your face right now."
+            return
+        }
+        message = nil
+        setForward(Self.median(recent.map { $0.1 }))
+        retarget()
     }
 
     private func stopTimer() {
@@ -667,7 +611,7 @@ final class HeadTrackingController: ObservableObject {
         if enabled && (calibration == nil || calibration?.cameraID != cameraID) {
             enabled = false
             defaults.set(false, forKey: Self.enabledKey)
-            message = "Head tracking needs a calibration for this camera. Turn it on again to calibrate."
+            message = "Head tracking needs to know where straight ahead is for this camera. Turn it on again to set it."
         }
         updateCamera()
         retarget()

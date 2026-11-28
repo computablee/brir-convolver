@@ -145,10 +145,11 @@ head tracking off at launch and tells you; it never prompts at launch.
 - **Tracking** uses Apple's frameworks only: AVFoundation captures from the camera you pick, and Vision's face
   detection (`VNDetectFaceRectanglesRequest`, revision 3) reports the face's yaw and pitch about 20 times a second.
   Head tilt (roll) is ignored. The app does no image processing of its own, and video is never stored.
-- **Calibration** runs the first time and whenever you pick another camera, or on demand with *Recalibrate…*: look
-  straight ahead, then turn 45° left, 45° right, and tilt 45° up and 45° down. Each step has a 3-second countdown,
-  then about a second of capture that ends with a chime. Vision's readings are mapped piecewise-linearly through these
-  five points, so its sign conventions and the camera's position don't matter.
+- **Straight ahead** is set the first time, and again whenever you pick another camera: look forward, wait through a
+  3-second countdown, and hold still until the chime. After that, press *Recenter* at any time to make wherever you're
+  looking straight ahead. Head angles are Vision's change from that reading. Apple documents pitch as positive when
+  nodding down and yaw as positive counterclockwise, which is taken to mean turning left. If your camera reports a
+  direction backwards in the live readout, turn on *Reverse left/right* or *Reverse up/down*.
 - **Mapping:** each speaker's position is rotated opposite to your head (yaw, then pitch) and snapped to the nearest
   exported direction, with 2° of hysteresis so a head held on a boundary doesn't flip between files. With your head
   turned 90° left, the side-left speaker plays the A0° BRIR. The finer the folder's spatial resolution, the smoother

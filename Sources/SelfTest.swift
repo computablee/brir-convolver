@@ -441,18 +441,15 @@ enum SelfTest {
     /// Calibration mapping, head rotation, and nearest-direction choice with hysteresis.
     static func testHeadTrackingMath() {
         func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-9 }
-        // A made-up camera whose yaw is positive to the left, offset, and asymmetric.
-        let cal = HeadCalibration(cameraID: "", forward: RawPose(yaw: 2, pitch: -3), left: RawPose(yaw: 32, pitch: -3),
-                                  right: RawPose(yaw: -25, pitch: -3), up: RawPose(yaw: 2, pitch: 20),
-                                  down: RawPose(yaw: 2, pitch: -30))
-        let m = [cal.pose(cal.forward), cal.pose(cal.left), cal.pose(cal.right), cal.pose(cal.up), cal.pose(cal.down),
-                 cal.pose(RawPose(yaw: 17, pitch: -3)), cal.pose(RawPose(yaw: 47, pitch: -3))]
-        let calOK = cal.problem == nil && near(m[0].yaw, 0) && near(m[0].pitch, 0) && near(m[1].yaw, -45) && near(m[2].yaw, 45)
-            && near(m[3].pitch, 45) && near(m[4].pitch, -45) && near(m[5].yaw, -22.5) && near(m[6].yaw, -67.5)
-        var flat = cal; flat.left = RawPose(yaw: 4, pitch: -3)
-        var sameSide = cal; sameSide.right = RawPose(yaw: 20, pitch: -3)
-        report(calOK && flat.problem != nil && sameSide.problem != nil,
-               "head calibration maps forward/45° points exactly, interpolates and extrapolates, and rejects bad readings")
+        // Vision's conventions (yaw positive counterclockwise = turning left, pitch positive = nodding down),
+        // relative to a forward reading that isn't zero.
+        let cal = HeadCalibration(cameraID: "", forward: RawPose(yaw: 2, pitch: -3))
+        let f = cal.pose(RawPose(yaw: 2, pitch: -3))
+        let left = cal.pose(RawPose(yaw: 32, pitch: -3)), down = cal.pose(RawPose(yaw: 2, pitch: 17))
+        let flipped = cal.pose(RawPose(yaw: 32, pitch: 17), reverseYaw: true, reversePitch: true)
+        let calOK = near(f.yaw, 0) && near(f.pitch, 0) && near(left.yaw, -30) && near(left.pitch, 0)
+            && near(down.pitch, -20) && near(flipped.yaw, 30) && near(flipped.pitch, 20)
+        report(calOK, "head pose: offsets from straight ahead, in ASH's signs (and reversible per axis)")
 
         func rel(_ e: Int, _ a: Int, yaw: Double, pitch: Double) -> (Double, Double) {
             let r = HeadRotation.relative(Direction(elevation: e, azimuth: a), head: HeadPose(yaw: yaw, pitch: pitch))

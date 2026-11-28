@@ -410,7 +410,9 @@ struct HeadTrackingSection: View {
                 }
                 Spacer()
                 if ht.enabled {
-                    Button("Recalibrate…") { ht.beginCalibration() }
+                    Button("Recenter") { ht.recenter() }
+                        .disabled(!ht.faceVisible)
+                        .help("Make the direction you're looking right now straight ahead.")
                 }
             }
             if ht.enabled {
@@ -430,6 +432,12 @@ struct HeadTrackingSection: View {
                             .monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
+                HStack(spacing: 16) {
+                    Toggle("Reverse left/right", isOn: $ht.reverseYaw)
+                    Toggle("Reverse up/down", isOn: $ht.reversePitch)
+                }
+                Text("Turn your head and check the readout above. If it reports the opposite direction, reverse that axis.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if !ht.trackedSummary.isEmpty {
                     Text(ht.trackedSummary).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
@@ -454,7 +462,7 @@ struct HeadTrackingSection: View {
     }
 
     private var status: String {
-        if !ht.cameraRunning { return ht.calibration == nil ? "Not calibrated" : "Camera off" }
+        if !ht.cameraRunning { return ht.calibration == nil ? "Straight ahead not set yet" : "Camera off" }
         if ht.faceVisible { return "Tracking" }
         return "No face in view (holding the last position, then easing back to front)"
     }
@@ -467,30 +475,29 @@ struct HeadTrackingSection: View {
     }
 }
 
-/// The five-step calibration: forward, then 45° left, right, up and down.
+/// Sets straight ahead: look forward, count down, capture.
 struct CalibrationSheet: View {
     @ObservedObject var ht = HeadTrackingController.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Head tracking calibration").font(.title2.weight(.semibold))
+            Text("Set straight ahead").font(.title2.weight(.semibold))
             switch ht.calibrationPhase {
             case .ready:
-                Text("Sit where you normally listen. You'll be asked to look straight ahead, then turn your head 45° left, "
-                     + "45° right, and tilt it 45° up and 45° down. Each position gets a 3-second countdown; then hold "
-                     + "still until you hear a chime, which means it's time for the next one.")
+                Text("Sit where you normally listen and look straight ahead, wherever the centre speaker should be. "
+                     + "Press Start, keep looking there through the 3-second countdown, and hold still until the chime.")
                     .fixedSize(horizontal: false, vertical: true)
             case .countdown, .capturing:
-                Text("Step \(ht.calibrationStep + 1) of \(CalibrationStep.allCases.count)").font(.caption).foregroundStyle(.secondary)
-                Text(ht.currentStep.instruction).font(.title3)
+                Text("Look straight ahead.").font(.title3)
                 Text(ht.calibrationPhase == .countdown ? "\(ht.countdown)" : "Hold still…")
                     .font(.system(size: 40, weight: .light)).monospacedDigit()
             case .failed:
-                Text(ht.calibrationProblem ?? "Calibration failed.").foregroundStyle(.orange)
+                Text(ht.calibrationProblem ?? "That didn't work.").foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             case .done:
-                Text("Calibrated. Turn your head and the speakers should stay where they are in the room. "
-                     + "Recalibrate any time from the Head tracking section.")
+                Text("Done. Turn your head and the speakers should stay where they are in the room. If they move the "
+                     + "wrong way, use the Reverse switches. Press Recenter whenever you want to make where you're "
+                     + "looking straight ahead again.")
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 8) {
@@ -510,7 +517,7 @@ struct CalibrationSheet: View {
                 case .ready:
                     Button("Start") { ht.startCalibration() }.keyboardShortcut(.defaultAction)
                 case .failed:
-                    Button("Try again") { ht.retryCalibration() }.keyboardShortcut(.defaultAction)
+                    Button("Try again") { ht.startCalibration() }.keyboardShortcut(.defaultAction)
                 case .done:
                     Button("Done") { ht.finishCalibration() }.keyboardShortcut(.defaultAction)
                 case .countdown, .capturing:
