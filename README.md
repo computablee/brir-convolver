@@ -153,7 +153,10 @@ head tracking off at launch and tells you; it never prompts at launch.
 - **Mapping:** each speaker's position is rotated opposite to your head (yaw, then pitch) and snapped to the nearest
   exported direction, with 2° of hysteresis so a head held on a boundary doesn't flip between files. With your head
   turned 90° left, the side-left speaker plays the A0° BRIR. The finer the folder's spatial resolution, the smoother
-  the movement.
+  the movement. *Direction rounding* changes how the measured direction picks a file. *Round to nearest* is the
+  default. *Round towards front* takes the closest file that's no further from straight ahead on each axis: with files
+  at A0° and A5°, 0–4.99° uses A0° and 5–9.99° uses A5°. *Round away from front* does the opposite. Both modes round
+  azimuth and elevation, with the same 2° hysteresis.
 - **Switching** is click-free. The new BRIR is loaded off the audio thread (resampled if the folder's rate differs
   from the device's) and crossfaded over about 20 ms on the same input. After the fade the output is exactly the input
   convolved with the new BRIR. Recently used directions are cached.

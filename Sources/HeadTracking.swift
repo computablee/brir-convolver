@@ -51,6 +51,28 @@ enum HeadRotation {
     }
 }
 
+/// How a head-relative direction picks among the exported ones. Azimuth and elevation are each rounded
+/// relative to straight ahead (azimuth 0°, elevation 0°).
+enum DirectionRounding: String, CaseIterable, Identifiable {
+    /// The closest exported direction.
+    case nearest
+    /// The closest exported direction that is no further from straight ahead, on each axis, than the measured one.
+    /// With files at A0° and A5°: 0–4.99° → A0°, 5–9.99° → A5°.
+    case towardFront
+    /// The closest exported direction that is no closer to straight ahead, on each axis, than the measured one.
+    /// With files at A0° and A5°: 0.01–5° → A5°.
+    case awayFromFront
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .nearest: return "Round to nearest"
+        case .towardFront: return "Round towards front"
+        case .awayFromFront: return "Round away from front"
+        }
+    }
+}
+
 /// The directions of a directional BRIR folder, for fast nearest-direction lookups.
 struct DirectionIndex {
     private let dirs: [Direction]
@@ -83,6 +105,47 @@ struct DirectionIndex {
         let u = Self.unit(Double(cur.elevation), Double(cur.azimuth))
         let curAngle = Self.degrees(u.0 * v.0 + u.1 * v.1 + u.2 * v.2)
         return curAngle - Self.degrees(bestDot) > hysteresis ? b : cur
+    }
+
+    /// The exported direction for (elevation, azimuth) under `mode`. With a `current` direction, the choice only
+    /// changes once the target has moved `hysteresis` degrees (per axis) past the point where it would switch.
+    func choose(elevation e: Double, azimuth a: Double, mode: DirectionRounding, current: Direction?,
+                hysteresis: Double) -> Direction {
+        if mode == .nearest { return nearest(elevation: e, azimuth: a, current: current, hysteresis: hysteresis) }
+        let c = rounded(elevation: e, azimuth: a, mode: mode)
+        guard let cur = current, cur != c, hysteresis > 0 else { return c }
+        // Would the current direction still be chosen if the target were up to `hysteresis` closer to it?
+        let e2 = e + max(-hysteresis, min(hysteresis, Double(cur.elevation) - e))
+        let a2 = a + max(-hysteresis, min(hysteresis, Self.wrap(Double(cur.azimuth) - a)))
+        return rounded(elevation: e2, azimuth: Self.wrap(a2), mode: mode) == cur ? cur : c
+    }
+
+    /// Angle in (−180, 180].
+    static func wrap(_ x: Double) -> Double {
+        let r = (x + 180).truncatingRemainder(dividingBy: 360)
+        return (r <= 0 ? r + 360 : r) - 180
+    }
+
+    /// Nearest exported direction among those that round the right way on both axes (any direction, if none do).
+    private func rounded(elevation e: Double, azimuth a: Double, mode: DirectionRounding) -> Direction {
+        let eps = 1e-6
+        /// Is `x` (a candidate's coordinate) on the right side of `t` (the target's), measured from 0?
+        func ok(_ x: Double, _ t: Double, bothSides: Bool) -> Bool {
+            let sameSide = bothSides || abs(x) < eps || (abs(t) < eps ? mode == .awayFromFront : (x > 0) == (t > 0))
+            guard sameSide else { return false }
+            return mode == .towardFront ? abs(x) <= abs(t) + eps : abs(x) >= abs(t) - eps
+        }
+        let v = Self.unit(e, a)
+        var best = -1, bestDot = -2.0
+        for (i, d) in dirs.enumerated() {
+            let de = Double(d.elevation), da = Double(d.azimuth)
+            // ±180° is directly behind: on both the left and the right.
+            guard ok(de, e, bothSides: false), ok(da, a, bothSides: abs(abs(da) - 180) < eps) else { continue }
+            let u = vecs[i]
+            let dot = u.0 * v.0 + u.1 * v.1 + u.2 * v.2
+            if dot > bestDot + 1e-12 { best = i; bestDot = dot }
+        }
+        return best >= 0 ? dirs[best] : nearest(elevation: e, azimuth: a, current: nil, hysteresis: 0)
     }
 }
 
@@ -215,6 +278,7 @@ final class HeadTrackingController: ObservableObject {
     private let defaults = UserDefaults.standard
     private static let enabledKey = "headTracking", cameraKey = "headTrackingCamera", calibrationKey = "headCalibration"
     private static let reverseYawKey = "headTrackingReverseYaw", reversePitchKey = "headTrackingReversePitch"
+    private static let roundingKey = "headTrackingRounding"
 
     /// The user's toggle (persisted). Only ever on with camera access granted.
     @Published private(set) var enabled: Bool
@@ -245,6 +309,10 @@ final class HeadTrackingController: ObservableObject {
     /// Vision reports the opposite signs from the default assumption (persisted).
     @Published var reverseYaw: Bool { didSet { defaults.set(reverseYaw, forKey: Self.reverseYawKey) } }
     @Published var reversePitch: Bool { didSet { defaults.set(reversePitch, forKey: Self.reversePitchKey) } }
+    /// How a head-relative direction picks an exported one (persisted).
+    @Published var rounding: DirectionRounding {
+        didSet { defaults.set(rounding.rawValue, forKey: Self.roundingKey); retarget() }
+    }
 
     @Published private(set) var calibrationVisible = false
     @Published private(set) var calibrationPhase = CalibrationPhase.ready
@@ -298,6 +366,7 @@ final class HeadTrackingController: ObservableObject {
         cameraID = defaults.string(forKey: Self.cameraKey) ?? ""
         reverseYaw = defaults.bool(forKey: Self.reverseYawKey)
         reversePitch = defaults.bool(forKey: Self.reversePitchKey)
+        rounding = DirectionRounding(rawValue: defaults.string(forKey: Self.roundingKey) ?? "") ?? .nearest
         if let d = defaults.data(forKey: Self.calibrationKey) {
             calibration = try? JSONDecoder().decode(HeadCalibration.self, from: d)
         }
@@ -421,8 +490,8 @@ final class HeadTrackingController: ObservableObject {
             let target: Direction
             if active {
                 let rel = HeadRotation.relative(tracked[i].world, head: head)
-                target = index.nearest(elevation: rel.elevation, azimuth: rel.azimuth,
-                                       current: tracked[i].applied, hysteresis: Self.hysteresis)
+                target = index.choose(elevation: rel.elevation, azimuth: rel.azimuth, mode: rounding,
+                                      current: tracked[i].applied, hysteresis: Self.hysteresis)
             } else {
                 target = tracked[i].base
             }

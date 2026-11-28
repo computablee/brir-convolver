@@ -483,6 +483,36 @@ enum SelfTest {
         }
         report(wrong.isEmpty, "nearest exported direction, with hysteresis at boundaries and wrap-around at ±180°"
                + (wrong.isEmpty ? "" : ": " + wrong.joined(separator: "; ")))
+
+        // Rounding towards / away from front on a 5° grid at E0° and E30°.
+        let fine = DirectionIndex(stride(from: -180, to: 180, by: 5).flatMap {
+            [Direction(elevation: 0, azimuth: $0), Direction(elevation: 30, azimuth: $0)] })
+        func D(_ e: Int, _ a: Int) -> Direction { Direction(elevation: e, azimuth: a) }
+        let rounding: [(DirectionRounding, Double, Double, Direction?, Direction, String)] = [
+            (.towardFront, 0, 4.99, nil, D(0, 0), "towards: 4.99° → A0"),
+            (.towardFront, 0, 5, nil, D(0, 5), "towards: 5° → A5"),
+            (.towardFront, 0, 9.99, nil, D(0, 5), "towards: 9.99° → A5"),
+            (.towardFront, 0, -4.99, nil, D(0, 0), "towards: −4.99° → A0"),
+            (.towardFront, 0, -7, nil, D(0, -5), "towards: −7° → A−5"),
+            (.towardFront, 0, 179, nil, D(0, 175), "towards: 179° → A175 (not behind)"),
+            (.towardFront, 20, 7, nil, D(0, 5), "towards: E20 A7 → E0 A5"),
+            (.towardFront, 0, -29.9, D(0, -30), D(0, -30), "towards + hysteresis: −29.9° stays on A−30"),
+            (.towardFront, 0, -27.5, D(0, -30), D(0, -25), "towards + hysteresis: −27.5° moves to A−25"),
+            (.awayFromFront, 0, 0, nil, D(0, 0), "away: 0° → A0"),
+            (.awayFromFront, 0, 0.1, nil, D(0, 5), "away: 0.1° → A5"),
+            (.awayFromFront, 0, 5, nil, D(0, 5), "away: 5° → A5"),
+            (.awayFromFront, 0, 5.01, nil, D(0, 10), "away: 5.01° → A10"),
+            (.awayFromFront, 0, -0.1, nil, D(0, -5), "away: −0.1° → A−5"),
+            (.awayFromFront, 0, 177, nil, D(0, -180), "away: 177° → behind (A−180)"),
+            (.awayFromFront, 20, 7, nil, D(30, 10), "away: E20 A7 → E30 A10"),
+            (.nearest, 0, 3, nil, D(0, 5), "nearest: 3° → A5"),
+        ]
+        let wrongRounding = rounding.compactMap { c -> String? in
+            let got = fine.choose(elevation: c.1, azimuth: c.2, mode: c.0, current: c.3, hysteresis: c.3 == nil ? 0 : 2)
+            return got == c.4 ? nil : "\(c.5) (got \(got.label))"
+        }
+        report(wrongRounding.isEmpty, "direction rounding towards and away from front (azimuth and elevation, with hysteresis)"
+               + (wrongRounding.isEmpty ? "" : ": " + wrongRounding.joined(separator: "; ")))
     }
 
     /// Swapping BRIRs live (head tracking): during the crossfade every sample lies between the old and new

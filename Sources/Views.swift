@@ -436,6 +436,11 @@ struct HeadTrackingSection: View {
                             .monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
+                Picker("Direction rounding", selection: $ht.rounding) {
+                    ForEach(DirectionRounding.allCases) { Text($0.label).tag($0) }
+                }
+                .help("How the measured direction of each speaker picks an exported BRIR. Towards front: with files at "
+                      + "0° and 5°, 0–4.99° uses 0° and 5–9.99° uses 5°. Applies to azimuth and elevation.")
                 HStack(spacing: 16) {
                     Toggle("Reverse left/right", isOn: $ht.reverseYaw)
                     Toggle("Reverse up/down", isOn: $ht.reversePitch)
