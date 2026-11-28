@@ -177,9 +177,14 @@ final class AppState: ObservableObject {
         if !irPath.isEmpty { loadIR(url: URL(fileURLWithPath: irPath), keepPreamp: true) }
         if enabled { start() }
 
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.pollMeters() }
+        // Registered for .common run-loop modes, not just .default: while a button is held
+        // (hold-to-solo, A/B), AppKit tracks the mouse in .eventTracking mode, and a
+        // .default-only timer would stop firing — freezing the meters and latency readout.
+        let timer = Timer(timeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollMeters() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
     }
 
     // MARK: IR
