@@ -470,13 +470,22 @@ enum SelfTest {
             + [Direction(elevation: 30, azimuth: 0)]
         let idx = DirectionIndex(grid)
         let a0 = Direction(elevation: 0, azimuth: 0), a15 = Direction(elevation: 0, azimuth: 15)
-        let nearOK = idx.nearest(elevation: 0, azimuth: 7, current: nil, hysteresis: 2) == a0
-            && idx.nearest(elevation: 0, azimuth: 8.5, current: a0, hysteresis: 2) == a0     // 6.5° vs 8.5°: stays
-            && idx.nearest(elevation: 0, azimuth: 9.5, current: a0, hysteresis: 2) == a15    // 5.5° vs 9.5°: moves
-            && idx.nearest(elevation: 0, azimuth: 8.5, current: nil, hysteresis: 2) == a15
-            && idx.nearest(elevation: 0, azimuth: 179, current: nil, hysteresis: 0) == Direction(elevation: 0, azimuth: -180)
-            && idx.nearest(elevation: 25, azimuth: 2, current: a0, hysteresis: 2) == Direction(elevation: 30, azimuth: 0)
-        report(nearOK, "nearest exported direction, with hysteresis at boundaries and wrap-around at ±180°")
+        // (elevation, azimuth, current, hysteresis, expected). Cases sit well clear of the 2° margin itself,
+        // where rounding in acos decides either way.
+        let cases: [(Double, Double, Direction?, Double, Direction, String)] = [
+            (0, 7, nil, 2, a0, "7° → A0"),
+            (0, 8, a0, 2, a0, "8° from A0: 7° vs 8°, stays"),
+            (0, 9.5, a0, 2, a15, "9.5° from A0: 5.5° vs 9.5°, moves"),
+            (0, 8, nil, 2, a15, "8° with no current → A15"),
+            (0, 179, nil, 0, Direction(elevation: 0, azimuth: -180), "179° wraps to A-180"),
+            (25, 2, a0, 2, Direction(elevation: 30, azimuth: 0), "E25 A2 → E30 A0"),
+        ]
+        let wrong = cases.compactMap { c -> String? in
+            let got = idx.nearest(elevation: c.0, azimuth: c.1, current: c.2, hysteresis: c.3)
+            return got == c.4 ? nil : "\(c.5) (got \(got.label))"
+        }
+        report(wrong.isEmpty, "nearest exported direction, with hysteresis at boundaries and wrap-around at ±180°"
+               + (wrong.isEmpty ? "" : ": " + wrong.joined(separator: "; ")))
     }
 
     /// Swapping BRIRs live (head tracking): during the crossfade every sample lies between the old and new

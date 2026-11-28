@@ -681,8 +681,10 @@ final class HeadTrackingController: ObservableObject {
     }
 }
 
-/// Directional BRIRs loaded for head tracking, resampled to the convolver's rate. Used on the loader queue only.
-final class DirectionalIRCache {
+/// Directional BRIRs loaded for head tracking, resampled to the convolver's rate.
+/// `@unchecked Sendable`: it's handed to the loader queue and only ever used there (a serial queue), so its state
+/// is never touched from two threads.
+final class DirectionalIRCache: @unchecked Sendable {
     private var rate = 0.0, maxLength = 0
     private var store: [Direction: (left: [Double], right: [Double])] = [:]
     private var order: [Direction] = []

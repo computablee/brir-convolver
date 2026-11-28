@@ -20,7 +20,10 @@ import os
 /// one over about `fadeSeconds`, applied to the same input history, so the change is click-free. Once the
 /// fade completes the output is exactly the input convolved with the new BRIR. The audio thread only ever
 /// `trylock`s the handshake lock and skips a block's bookkeeping if it's busy.
-final class Convolver {
+///
+/// `@unchecked Sendable`: it is built to be shared between threads. The audio thread renders, the UI reads and
+/// writes `params` (aligned words), and one loader thread calls `swapIR`, which is synchronised by `swapLock`.
+final class Convolver: @unchecked Sendable {
     static let defaultCeiling = pow(10, -0.01 / 20)   // −0.01 dBFS
 
     let blockSize: Int
