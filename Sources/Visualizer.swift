@@ -672,7 +672,7 @@ struct ImpulseTab: View {
                     return (s, String(format: "%@  %+.4f (%.1f dBFS)", VizTheme.name(s), v, 20 * log10(max(abs(v), 1e-9))))
                 }
                 drawTooltip(&ctx, at: hv, bounds: CGRect(origin: .zero, size: size),
-                            title: String(format: "%.3f ms · sample %d", Double(i) / a.sampleRate * 1000, i), rows: rows)
+                            title: String(format: "%.3f ms · sample %ld", Double(i) / a.sampleRate * 1000, i), rows: rows)
             }
         }
         .onContinuousHover { phase in

@@ -194,7 +194,7 @@ struct MainView: View {
                                 .help("Latency this app adds between an app's audio and the output device: "
                                       + "Core Audio capture→output plus the convolver partition. See the breakdown below.")
                             Text("DSP \(state.meters.computeAvgMs, specifier: "%.3f") ms (peak \(state.meters.computeMaxMs, specifier: "%.3f"))")
-                                .help(String(format: "Time spent computing each audio callback of %d frames: average %.3f ms, recent worst %.3f ms, deadline %.2f ms.",
+                                .help(String(format: "Time spent computing each audio callback of %ld frames: average %.3f ms, recent worst %.3f ms, deadline %.2f ms.",
                                              state.meters.callbackFrames, state.meters.computeAvgMs, state.meters.computeMaxMs, state.meters.budgetMs))
                             Text("Load \(state.meters.cpu * 100, specifier: "%.1f")%")
                                 .help("Average compute time as a share of the time available per callback. Dropouts start near 100%.")
@@ -208,8 +208,8 @@ struct MainView: View {
                     Text(String(format: "Delay: I/O %.1f ms + partition %.1f ms = %.1f ms added · output device reports %.1f ms",
                                 m.ioMs, m.partitionMs, m.addedDelayMs, m.downstreamMs))
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %d-frame callback, against a %.2f ms deadline (%.0f× headroom at peak). %llu callbacks, %llu with missing input.",
-                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0,
+                    Text(String(format: "Compute: %.3f ms average, %.3f ms recent peak per %ld-frame callback, against a %.2f ms deadline (%.0f× headroom at peak). %llu callbacks, %llu with missing input.",
+                                m.computeAvgMs, m.computeMaxMs, m.callbackFrames, m.budgetMs, m.computeMaxMs > 0 ? m.budgetMs / m.computeMaxMs : 0.0,
                                 m.callbacks, m.starved))
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }

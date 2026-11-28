@@ -149,8 +149,16 @@ final class AppState: ObservableObject {
     private var restartWork: DispatchWorkItem?
     private var meterTimer: Timer?
     private var restarting = false
+    /// Bumped by every stop (and so every start): a capture path still being prepared for an older one is discarded.
+    private var startGeneration = 0
+    /// Where capture paths are prepared (Core Audio calls that can block), one at a time.
+    private let pipelineQueue = DispatchQueue(label: "com.phil.brirconvolver.pipeline", qos: .userInitiated)
     /// Consecutive failed starts, for retry back-off (reset on success).
     private var failedStarts = 0
+    /// When the watchdog last rebuilt the capture path (the last minute's worth), for backing off.
+    private var watchdogRestartTimes: [Date] = []
+    /// `noOutputCallbacks` at the previous health check.
+    private var lastNoOutput: UInt64 = 0
 
     private init() {
         let d = UserDefaults.standard
@@ -474,8 +482,10 @@ final class AppState: ObservableObject {
         guard let r = p.renderContext else { return }
         let ticks = ticksToSeconds
         let now = (r.inSampleNow, r.inHostNow, r.outSampleNow, r.outHostNow, r.callbacks, r.starvedCallbacks, r.overruns, r.inJumps, r.outJumps)
-        defer { healthPrev = now }
+        let noOutputNow = r.noOutputCallbacks
+        defer { healthPrev = now; lastNoOutput = noOutputNow }
         guard let prev = healthPrev else { return }
+        let noOutput = noOutputNow &- lastNoOutput
         func rate(_ s1: Double, _ h1: UInt64, _ s0: Double, _ h0: UInt64) -> String {
             guard h1 > h0 else { return "n/a" }
             return String(format: "%.1f", (s1 - s0) / (Double(h1 - h0) * ticks))
@@ -484,11 +494,11 @@ final class AppState: ObservableObject {
         let scal = String(format: "in %.4f–%.4f out %.4f–%.4f", r.inRateMin, r.inRateMax, r.outRateMin, r.outRateMax)
         r.inRateMin = 10; r.inRateMax = 0; r.outRateMin = 10; r.outRateMax = 0
         let line = "capture \(inRate) Hz, output \(outRate) Hz (nominal \(Int(r.sampleRate))) · rate scalars \(scal) · "
-            + "callbacks +\(now.4 &- prev.4), short input +\(now.5 &- prev.5), overruns +\(now.6 &- prev.6), "
+            + "callbacks +\(now.4 &- prev.4) (without an output buffer +\(noOutput)), short input +\(now.5 &- prev.5), overruns +\(now.6 &- prev.6), "
             + "time jumps in +\(now.7 &- prev.7) out +\(now.8 &- prev.8), overload events \(p.overloads) · "
             + String(format: "load %.0f%%, worst callback %.2f ms, IO %.0f frames", r.cpuLoad * 100, r.computeWorst * 1000, r.ioFrames)
         r.computeWorst = 0
-        let abnormal = now.5 != prev.5 || now.6 != prev.6 || now.7 != prev.7 || now.8 != prev.8
+        let abnormal = now.5 != prev.5 || now.6 != prev.6 || now.7 != prev.7 || now.8 != prev.8 || noOutput > 0
         if abnormal { Log.health.error("\(line, privacy: .public)") } else { Log.health.notice("\(line, privacy: .public)") }
 
         checkSilentTap()
@@ -497,13 +507,21 @@ final class AppState: ObservableObject {
         // burst of Bluetooth reconfigurations. Rebuild the capture path instead of staying silent.
         if now.4 == prev.4 {
             Log.health.error("watchdog: no audio callbacks for 2 s; rebuilding the capture path")
-            scheduleRestart("watchdog: IO callbacks stopped")
+            watchdogRestart("watchdog: IO callbacks stopped")
+        } else if noOutput > 0 && noOutput == now.4 &- prev.4 {
+            // Core Audio is running us, but every callback came without an output buffer: nothing is being played.
+            let msg = "\(p.outputName) gave BRIR Convolver no output buffers for 2 s, so nothing could be played. Another "
+                + "app may be using it exclusively. If GraphWorks EQ plays to the same DAC, send the convolved audio to "
+                + "GraphWorks EQ under Output instead."
+            Log.health.error("watchdog: \(msg, privacy: .public)")
+            lastError = msg
+            watchdogRestart("watchdog: no output buffers")
         } else if !p.tapIsAlive {
             Log.health.error("watchdog: the system audio tap no longer exists; rebuilding the capture path")
-            scheduleRestart("watchdog: tap disappeared")
+            watchdogRestart("watchdog: tap disappeared")
         } else if now.1 != 0 && now.0 == prev.0 {
             Log.health.error("watchdog: capture time stopped advancing for 2 s; rebuilding the capture path")
-            scheduleRestart("watchdog: capture stalled")
+            watchdogRestart("watchdog: capture stalled")
         }
     }
 
@@ -658,15 +676,24 @@ final class AppState: ObservableObject {
 
     private func restartIfRunning(_ reason: String = "setting changed") { if enabled { scheduleRestart(reason) } }
 
-    private func scheduleRestart(_ reason: String = "unspecified") {
+    private func scheduleRestart(_ reason: String = "unspecified", after delay: Double = 0.25) {
         guard enabled else { return }
-        Log.pipeline.notice("restart requested: \(reason, privacy: .public)")
+        Log.pipeline.notice("restart requested: \(reason, privacy: .public)\(delay > 0.25 ? String(format: " (in %.0f s)", delay) : "", privacy: .public)")
         restartWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
             Task { @MainActor in self?.start() }
         }
         restartWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: w)
+    }
+
+    /// Rebuild after the watchdog finds the capture path broken, waiting longer each time it keeps happening
+    /// (0.25 s, then 2, 5 and 15 s within a minute) so a persistent problem doesn't become a rebuild loop.
+    private func watchdogRestart(_ reason: String) {
+        let now = Date()
+        watchdogRestartTimes = watchdogRestartTimes.filter { now.timeIntervalSince($0) < 60 } + [now]
+        let delays = [0.25, 2, 5, 15]
+        scheduleRestart(reason, after: delays[min(watchdogRestartTimes.count - 1, delays.count - 1)])
     }
 
     func start() {
@@ -711,9 +738,29 @@ final class AppState: ObservableObject {
         }
         let excl = usingSystemTap ? computeExclusions() : (ids: Set<AudioObjectID>(), names: [String]())
         let p = AudioPipeline()
+        let config = AudioPipeline.Config(outputUID: uid, inputUID: effectiveInputUID,
+                                          excludedProcesses: Array(excl.ids), driftCompensation: driftCompensation)
+        // Creating the tap and aggregate can take seconds when Core Audio is unhappy (the tap is retried in place),
+        // so it runs off the main thread; the UI stays responsive and a newer start or stop supersedes it.
+        let generation = startGeneration
+        status = "Starting…"
+        pipelineQueue.async {
+            let result = Result { try p.prepare(config) }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { AppState.shared.finishStart(generation, p, result, device: dev, exclusions: excl) }
+            }
+        }
+    }
+
+    /// Second half of `start()`, back on the main thread once the capture path exists.
+    private func finishStart(_ generation: Int, _ p: AudioPipeline, _ prepared: Result<Double, Error>, device dev: AudioObjectID,
+                             exclusions excl: (ids: Set<AudioObjectID>, names: [String])) {
+        guard generation == startGeneration, enabled else {
+            p.stop()   // superseded by a later start or stop
+            return
+        }
         do {
-            let rate = try p.prepare(.init(outputUID: uid, inputUID: effectiveInputUID,
-                                           excludedProcesses: Array(excl.ids), driftCompensation: driftCompensation))
+            let rate = try prepared.get()
             guard let ir = ir(at: rate) else { p.stop(); return }
             let roles = inputRoles(channels: p.inputChannels)
             let routing = Routing.make(brir: ir, roles: roles, lfeGain: lfeGainDB.map { pow(10, $0 / 20) } ?? 0)
@@ -738,10 +785,13 @@ final class AppState: ObservableObject {
             observedDevice = dev
             observeRate(of: dev)
             running = true
-            if !surroundSuspended { lastError = nil }
+            // Keep a watchdog's explanation up while it is still rebuilding (it would otherwise flash and vanish).
+            let watchdogBusy = watchdogRestartTimes.contains { Date().timeIntervalSince($0) < 60 }
+            if !surroundSuspended && !watchdogBusy { lastError = nil }
             let resampled = sourceIR.map { $0.sampleRate != rate } ?? false
             status = "Running → \(p.outputName)"
             failedStarts = 0
+            lastNoOutput = 0
             Log.pipeline.notice("running at \(Int(rate)) Hz, \(conv.sourceCount) sources × \(conv.partitions) partitions")
             healthPrev = nil
             let latencyMs = Double(blockSize) / rate * 1000
@@ -761,7 +811,7 @@ final class AppState: ObservableObject {
             status = String(format: "Error — retrying in %.0f s", delay)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 Task { @MainActor in
-                    guard let self, self.enabled, !self.running else { return }
+                    guard let self, self.enabled, !self.running, generation == self.startGeneration else { return }
                     self.scheduleRestart("retry after a failed start (attempt \(self.failedStarts + 1))")
                 }
             }
@@ -769,6 +819,7 @@ final class AppState: ObservableObject {
     }
 
     func stop(keepEnabled: Bool = false) {
+        startGeneration += 1
         if pipeline != nil { Log.pipeline.notice("stop") }
         headTracking.detach()
         pipeline?.stop()

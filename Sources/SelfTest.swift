@@ -181,7 +181,7 @@ enum SelfTest {
             }
         }
         let errDB = 20 * log10(maxErr / maxRef)
-        report(errDB < -130, String(format: "accuracy %@ B=%4d (%d sources): max error %.3e (%.1f dB re peak; Float32 output floor ≈ -144 dB)",
+        report(errDB < -130, String(format: "accuracy %@ B=%4ld (%ld sources): max error %.3e (%.1f dB re peak; Float32 output floor ≈ -144 dB)",
                                     label, B, routing.sources.count, maxErr, errDB))
     }
 
@@ -202,10 +202,10 @@ enum SelfTest {
         let finalGain = conv.params[Convolver.Param.gain]
         let expected = min(1, Convolver.defaultCeiling / rawPeak)
         let over = zip(yl, yr).filter { Double(abs($0.0)) > Convolver.defaultCeiling * (1 + 1e-6) || Double(abs($0.1)) > Convolver.defaultCeiling * (1 + 1e-6) }.count
-        report(over == 0 && peak <= 1, String(format: "adaptive preamp: output peak %.4f dBFS, %d samples over the −0.01 dBFS ceiling (raw peak %+.2f dBFS)",
+        report(over == 0 && peak <= 1, String(format: "adaptive preamp: output peak %.4f dBFS, %ld samples over the −0.01 dBFS ceiling (raw peak %+.2f dBFS)",
                                              20 * log10(peak), over, 20 * log10(rawPeak)))
         let relErr = abs(finalGain - expected) / expected
-        report(relErr < 1e-4, String(format: "adaptive preamp settles at the minimum reduction: %.4f dB (expected %.4f dB), lowered %d×",
+        report(relErr < 1e-4, String(format: "adaptive preamp settles at the minimum reduction: %.4f dB (expected %.4f dB), lowered %ld×",
                                      20 * log10(finalGain), 20 * log10(expected), Int(conv.params[Convolver.Param.reductions])))
         // Reset: back to 0 dB while the input is quiet.
         conv.requestGainReset()
@@ -279,7 +279,7 @@ enum SelfTest {
             }}
             let dt = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
             let audio = Double(iters * cb) / rate
-            print(String(format: "[INFO] %@ (%d sources) B=%4d (%3d partitions, +%.1f ms): %.0fx realtime → %.2f%% of one core",
+            print(String(format: "[INFO] %@ (%ld sources) B=%4ld (%3ld partitions, +%.1f ms): %.0fx realtime → %.2f%% of one core",
                          label, conv.sourceCount, B, conv.partitions, Double(B) / rate * 1000, audio / dt, dt / audio * 100))
         }
     }
@@ -435,7 +435,7 @@ enum SelfTest {
         for i in settle..<total { maxErr = max(maxErr, abs(al[i] - bl[i]), abs(ar[i] - br[i])) }
         let metersSeeAll = (0..<8).allSatisfy { a.inputPeaks[$0] > 0.2 }
         report(maxErr < 1e-6 && metersSeeAll,
-               String(format: "solo channel %d = that channel alone (max difference %.1e); meters still see all 8", ch + 1, maxErr))
+               String(format: "solo channel %ld = that channel alone (max difference %.1e); meters still see all 8", ch + 1, maxErr))
     }
 
     /// Calibration mapping, head rotation, and nearest-direction choice with hysteresis.
@@ -562,7 +562,7 @@ enum SelfTest {
         }
         let errDB = 20 * log10(max(maxErr, 1e-300) / maxRef)
         report(first && !again && second && !conv.swapsPending && errDB < -130 && outside < 1e-6,
-               String(format: "live BRIR swap: exact before and after the %d-block crossfade (max error %.1f dB re peak); "
+               String(format: "live BRIR swap: exact before and after the %ld-block crossfade (max error %.1f dB re peak); "
                       + "the fade stays between the old and new outputs (overshoot %.1e)", conv.fadeBlocks, errDB, max(0, outside)))
     }
 
