@@ -12,6 +12,7 @@ xcrun swiftc -O -wmo -parse-as-library -swift-version 5 \
     -target arm64-apple-macos14.4 \
     -framework CoreAudio -framework AudioToolbox -framework Accelerate \
     -framework AppKit -framework SwiftUI -framework ServiceManagement -framework AVFoundation \
+    -framework Vision -framework CoreMedia -framework CoreVideo \
     Sources/*.swift -o "$APP/Contents/MacOS/BRIRConvolver"
 
 cp Info.plist "$APP/Contents/Info.plist"

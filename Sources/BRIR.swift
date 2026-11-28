@@ -117,6 +117,8 @@ struct BRIRSet {
     var format: String
     /// For directional folders: the direction chosen for each speaker.
     var chosen: [String] = []
+    /// For directional folders: the exported direction each speaker's BRIR came from.
+    var directions: [Speaker: Direction] = [:]
 
     var length: Int { speakers.map { max($0.left.count, $0.right.count) }.max() ?? 0 }
     func ir(_ s: Speaker) -> SpeakerIR? { speakers.first { $0.speaker == s } }
@@ -171,6 +173,7 @@ struct BRIRSet {
         var list: [SpeakerIR] = []
         var rate = 0.0
         var used: [String] = []
+        var dirs: [Speaker: Direction] = [:]
         for s in Speaker.directional {
             if s.isHeight && !folder.hasHeights { continue }
             let want = positions[s] ?? s.defaultDirection
@@ -186,10 +189,12 @@ struct BRIRSet {
             }
             list.append(SpeakerIR(speaker: s, left: wav.channels[0], right: wav.channels[1]))
             used.append("\(s.rawValue) \(d.label)")
+            dirs[s] = d
         }
         speakers = list
         sampleRate = rate
         chosen = used
+        directions = dirs
         format = "directional (\(folder.files.count) directions)"
     }
 
@@ -207,6 +212,7 @@ struct BRIRSet {
         let s = speakers.enumerated().map { i, sp in SpeakerIR(speaker: sp.speaker, left: out[2 * i], right: out[2 * i + 1]) }
         var r = BRIRSet(speakers: s, sampleRate: rate, format: format)
         r.chosen = chosen
+        r.directions = directions
         return r
     }
 
