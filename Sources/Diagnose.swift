@@ -131,7 +131,7 @@ enum Diagnose {
                                                  ("main + surround, drift off", true, false),
                                                  ("surround as main + output, drift on", false, true)] {
                 let r = aggregateTest(output: o.uid, surround: dev, mainIsOutput: mainIsOutput, drift: drift)
-                print(String(format: "  %@ %@: input peak %.3f, callbacks %d, surround driver running during test: %@",
+                print(String(format: "  %@ %@: input peak %.3f, callbacks %ld, surround driver running during test: %@",
                              r.peak > 0.01 ? "[PASS]" : "[FAIL]", label, r.peak, r.callbacks, r.driverRunning))
                 if label.hasSuffix("(current app)") { aggOK = r.peak > 0.01 }
             }

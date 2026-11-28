@@ -38,6 +38,8 @@ final class AudioPipeline: @unchecked Sendable {
     private(set) var overloads = 0
     var cpuLoad: Double { context?.cpuLoad ?? 0 }
     var callbacks: UInt64 { context?.callbacks ?? 0 }
+    /// Callbacks in which the aggregate gave us no output buffer to write (so nothing was played).
+    var noOutputCallbacks: UInt64 { context?.noOutputCallbacks ?? 0 }
     var starvedCallbacks: UInt64 { context?.starvedCallbacks ?? 0 }
     /// Frames between the input time and the output time inside our IOProc (measured from HAL timestamps).
     var measuredIOFrames: Double { context?.ioFrames ?? 0 }
@@ -67,6 +69,16 @@ final class AudioPipeline: @unchecked Sendable {
             kAudioAggregateDeviceIsStackedKey: false,
         ]
         var fallbackRate = 0.0
+
+        // A device held in exclusive (hog) mode by another process gives an aggregate no output buffers: Core Audio
+        // runs the IOProc, but nothing can be played. Say who has it instead of starting a pipeline that's silent.
+        if let outDev = CA.device(forUID: config.outputUID),
+           let hog = CA.get(outDev, kAudioDevicePropertyHogMode, initial: pid_t(-1)), hog > 0, hog != getpid() {
+            let who = CA.processObjects().first { $0.pid == hog }?.displayName ?? "process \(hog)"
+            throw PipelineError("\(CA.deviceName(outDev) ?? "The output device") is in exclusive (hog) mode, held by \(who), "
+                + "so BRIR Convolver can't play to it. Under Output, send the convolved audio to GraphWorks EQ (or the system "
+                + "default) instead, or turn off exclusive mode in \(who).")
+        }
 
         if let inUID = config.inputUID {
             // Multichannel input device: output device first (clock master), then the input device, whose
@@ -250,6 +262,8 @@ final class RenderContext {
     private let ticksToSeconds: Double
     var cpuLoad: Double = 0
     var callbacks: UInt64 = 0
+    /// Callbacks with no output buffer (or no data in it): Core Audio ran us but there was nowhere to play.
+    var noOutputCallbacks: UInt64 = 0
     var ioFrames: Double = 0
     var computeAvg: Double = 0
     var computeMax: Double = 0
@@ -295,6 +309,7 @@ final class RenderContext {
     func render(_ input: UnsafePointer<AudioBufferList>, _ output: UnsafeMutablePointer<AudioBufferList>,
                 inTime: UnsafePointer<AudioTimeStamp>, outTime: UnsafePointer<AudioTimeStamp>) {
         let t0 = mach_absolute_time()
+        callbacks &+= 1   // every callback, so the watchdog never mistakes "no output buffer" for "IO stopped"
         let valid = AudioTimeStampFlags.sampleTimeValid
         if inTime.pointee.mFlags.contains(valid) && outTime.pointee.mFlags.contains(valid) {
             let d = outTime.pointee.mSampleTime - inTime.pointee.mSampleTime
@@ -321,14 +336,14 @@ final class RenderContext {
         }
         let outs = UnsafeMutableAudioBufferListPointer(output)
         let ins = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
-        guard outs.count > 0 else { return }
+        guard outs.count > 0 else { noOutputCallbacks &+= 1; return }
 
         // Zero every output channel first; we then fill channels 1 & 2.
         for b in outs where b.mData != nil { memset(b.mData!, 0, Int(b.mDataByteSize)) }
 
         // Destination: first two channels of the output device.
         let out0 = outs[0]
-        guard let o0 = out0.mData?.assumingMemoryBound(to: Float.self) else { return }
+        guard let o0 = out0.mData?.assumingMemoryBound(to: Float.self) else { noOutputCallbacks &+= 1; return }
         let outCh = max(1, Int(out0.mNumberChannels))
         let frames = Int(out0.mDataByteSize) / (MemoryLayout<Float>.size * outCh)
         let dstL = o0
@@ -376,7 +391,6 @@ final class RenderContext {
             convolver.process(inputs: inPtrs, inStrides: inStrides, outL: dstL, outR: dstR, outStride: outStride, frames: n)
         }
 
-        callbacks &+= 1
         if frames > 0 {
             let elapsed = Double(mach_absolute_time() - t0) * ticksToSeconds
             let budget = Double(frames) / sampleRate
