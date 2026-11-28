@@ -1,5 +1,6 @@
 import Accelerate
 import Foundation
+import os
 
 /// Uniformly-partitioned overlap-save convolver: any number of mono sources (each a weighted sum of input
 /// channels) convolved with their left-/right-ear BRIRs and summed to two outputs. Double precision throughout.
@@ -13,6 +14,12 @@ import Foundation
 /// that would clip. The gain never rises again on its own (only `requestGainReset()` raises it). The result:
 /// no sample ever exceeds the ceiling, and the gain is the highest value that has kept the audio played so far
 /// below it.
+///
+/// **BRIR swaps (head tracking).** Each source has two filter slots. `swapIR` writes a new BRIR into the slot
+/// that isn't playing, off the audio thread; the audio thread then crossfades from the old filter to the new
+/// one over about `fadeSeconds`, applied to the same input history, so the change is click-free. Once the
+/// fade completes the output is exactly the input convolved with the new BRIR. The audio thread only ever
+/// `trylock`s the handshake lock and skips a block's bookkeeping if it's busy.
 final class Convolver {
     static let defaultCeiling = pow(10, -0.01 / 20)   // −0.01 dBFS
 
@@ -28,7 +35,7 @@ final class Convolver {
     private let log2n: vDSP_Length
     private let setup: FFTSetupD
 
-    private let hRe: UnsafeMutablePointer<Double>   // [S][2][P][H]
+    private let hRe: UnsafeMutablePointer<Double>   // [S][slot 2][ear 2][P][H]
     private let hIm: UnsafeMutablePointer<Double>
     private let xRe: UnsafeMutablePointer<Double>   // [S][P][H] frequency-domain delay lines
     private let xIm: UnsafeMutablePointer<Double>
@@ -63,6 +70,31 @@ final class Convolver {
 
     private var mix: Double
     private var dryGain: Double = 1
+
+    // BRIR swaps. `activeSlot` is changed only by the audio thread, and only while that source's
+    // `swapState` is 2, so the loader may read it whenever the state is 0.
+    /// Speaker of each source, in source order (read by the UI / head tracking).
+    let sourceSpeakers: [Speaker]
+    static let fadeSeconds = 0.02
+    /// Blocks a crossfade lasts (≥ 1).
+    let fadeBlocks: Int
+    private let activeSlot: UnsafeMutablePointer<Int>   // S: filter slot each source plays from
+    /// Per source, guarded by `swapLock`: 0 idle (the inactive slot belongs to the loader), 1 new BRIR written
+    /// to the inactive slot (loader → audio), 2 crossfading (the audio thread uses both slots).
+    private let swapState: UnsafeMutablePointer<Int>
+    private let swapLock: UnsafeMutablePointer<os_unfair_lock>
+    /// Sources in the current crossfade batch (audio thread). All fades in a batch start and end together.
+    private let fadeList: UnsafeMutablePointer<Int>
+    private var fadeCount = 0
+    private var fadeStep = 0
+    /// The batch has finished (slots switched) but its swap states haven't been released yet.
+    private var fadeDone = false
+    private let allSources: UnsafeMutablePointer<Int>   // 0 ..< S
+    private let fadeOld: UnsafeMutablePointer<Double>   // B: fading sources through their old filters
+    private let fadeNew: UnsafeMutablePointer<Double>   // B: … and through their new ones
+    /// Scratch for `swapIR` (loader thread only).
+    private let prepTime: UnsafeMutablePointer<Double>
+    private let filterScale: Double
 
     // Surround test clip (binaural, already convolved). Written by the UI thread only while the audio thread
     // isn't using it (test state idle or finished).
@@ -132,7 +164,7 @@ final class Convolver {
             p.initialize(repeating: 0, count: max(n, 1))
             return p
         }
-        let hr = alloc(S * 2 * P * H), hi = alloc(S * 2 * P * H)
+        let hr = alloc(S * 2 * 2 * P * H), hi = alloc(S * 2 * 2 * P * H)
         hRe = hr; hIm = hi
         xRe = alloc(S * P * H); xIm = alloc(S * P * H)
         accRe = alloc(H); accIm = alloc(H)
@@ -164,19 +196,24 @@ final class Convolver {
         dryLCount = nL; dryLChan = dlc; dryLGain = dlg
         dryRCount = nR; dryRChan = drc; dryRGain = drg
 
+        sourceSpeakers = routing.sources.map(\.speaker)
+        fadeBlocks = max(1, Int((Convolver.fadeSeconds * sampleRate / Double(B)).rounded(.up)))
+        activeSlot = allocInt(S)
+        swapState = allocInt(S)
+        let lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lock.initialize(to: os_unfair_lock())
+        swapLock = lock
+        fadeList = allocInt(S)
+        let all = allocInt(S)
+        for s in 0..<S { all[s] = s }
+        allSources = all
+        fadeOld = alloc(B); fadeNew = alloc(B)
+        prepTime = alloc(fftN)
+
         // vDSP's packed real FFT: forward scales by 2, inverse by N → product needs 1/(4N).
-        let scale = 1.0 / (4.0 * Double(fftN))
+        filterScale = 1.0 / (4.0 * Double(fftN))
         for (s, src) in routing.sources.enumerated() {
-            for (o, h) in [src.left, src.right].enumerated() {
-                for p in 0..<P {
-                    for i in 0..<fftN { time[i] = 0 }
-                    let start = p * B
-                    let end = min(start + B, h.count)
-                    if start < end { for i in start..<end { time[i - start] = h[i] * scale } }
-                    let k = (s * 2 + o) * P + p
-                    forward(time, re: hRe + k * H, im: hIm + k * H)
-                }
-            }
+            for (o, h) in [src.left, src.right].enumerated() { loadFilter(h, source: s, slot: 0, ear: o, scratch: time) }
         }
 
         params.initialize(repeating: 0, count: Param.count)
@@ -188,8 +225,10 @@ final class Convolver {
     deinit {
         vDSP_destroy_fftsetupD(setup)
         for p in [hRe, hIm, xRe, xIm, accRe, accIm, time, srcIn, dryL, dryR, outL, outR, frameIn, inputPeaks, channelGain,
-                  routeGain, dryLGain, dryRGain, params] { p.deallocate() }
-        for p in [routeStart, routeChan, dryLChan, dryRChan] { p.deallocate() }
+                  routeGain, dryLGain, dryRGain, params, fadeOld, fadeNew, prepTime] { p.deallocate() }
+        for p in [routeStart, routeChan, dryLChan, dryRChan, activeSlot, swapState, fadeList, allSources] { p.deallocate() }
+        swapLock.deinitialize(count: 1)
+        swapLock.deallocate()
         testL?.deallocate(); testR?.deallocate()
     }
 
@@ -225,6 +264,46 @@ final class Convolver {
         if st == 1 || st == 2 { params[Param.testState] = 4 }
     }
 
+    /// Partition one ear's impulse response into the frequency domain, into `slot` of `source`.
+    private func loadFilter(_ h: [Double], source s: Int, slot: Int, ear o: Int, scratch: UnsafeMutablePointer<Double>) {
+        let P = partitions, H = half, B = blockSize
+        for p in 0..<P {
+            for i in 0..<N { scratch[i] = 0 }
+            let start = p * B
+            let end = min(start + B, h.count)
+            if start < end { for i in start..<end { scratch[i - start] = h[i] * filterScale } }
+            let k = ((s * 2 + slot) * 2 + o) * P + p
+            forward(scratch, re: hRe + k * H, im: hIm + k * H)
+        }
+    }
+
+    /// Replace source `s`'s BRIR (at this convolver's sample rate; anything past `partitions × blockSize`
+    /// samples is dropped), crossfading over about `fadeSeconds`. Call from one background thread at a time —
+    /// never the audio thread. Returns false, changing nothing, while that source's previous swap is still
+    /// being applied; try again shortly.
+    func swapIR(source s: Int, left: [Double], right: [Double]) -> Bool {
+        guard s >= 0 && s < sourceCount else { return false }
+        os_unfair_lock_lock(swapLock)
+        let busy = swapState[s] != 0
+        let slot = 1 - activeSlot[s]
+        os_unfair_lock_unlock(swapLock)
+        if busy { return false }
+        // The inactive slot isn't read by the audio thread while the state is 0.
+        loadFilter(left, source: s, slot: slot, ear: 0, scratch: prepTime)
+        loadFilter(right, source: s, slot: slot, ear: 1, scratch: prepTime)
+        os_unfair_lock_lock(swapLock)   // the unlock publishes the filter before the state change
+        swapState[s] = 1
+        os_unfair_lock_unlock(swapLock)
+        return true
+    }
+
+    /// True while any source has a swap requested or crossfading.
+    var swapsPending: Bool {
+        os_unfair_lock_lock(swapLock)
+        defer { os_unfair_lock_unlock(swapLock) }
+        return (0..<sourceCount).contains { swapState[$0] != 0 }
+    }
+
     var testActive: Bool { let st = params[Param.testState]; return st == 1 || st == 2 || st == 4 }
     var testFinished: Bool { params[Param.testState] == 3 }
     var testPosition: Int { Int(params[Param.testPos]) }
@@ -238,40 +317,85 @@ final class Convolver {
         vDSP_fft_zripD(setup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
     }
 
+    /// Sum `list[0..<count]` through ear `o`'s filters (each source's active slot, or the other slot with
+    /// `otherSlot`) and write the block's valid output samples to `dst`.
+    @inline(__always)
+    private func convolve(ear o: Int, list: UnsafePointer<Int>, count: Int, otherSlot: Bool, into dst: UnsafeMutablePointer<Double>) {
+        let P = partitions, H = half, B = blockSize
+        vDSP_vclrD(accRe, 1, vDSP_Length(H))
+        vDSP_vclrD(accIm, 1, vDSP_Length(H))
+        var acc = DSPDoubleSplitComplex(realp: accRe, imagp: accIm)
+        var accOut = acc
+        var dc = 0.0, ny = 0.0
+        var slot = fdlPos
+        for p in 0..<P {
+            for i in 0..<count {
+                let s = list[i]
+                let f = otherSlot ? 1 - activeSlot[s] : activeSlot[s]
+                let xr = xRe + (s * P + slot) * H, xi = xIm + (s * P + slot) * H
+                let k = ((s * 2 + f) * 2 + o) * P + p
+                let hr = hRe + k * H, hi = hIm + k * H
+                // Packed bin 0 holds DC (real) and Nyquist (imag) — both purely real products.
+                dc += xr[0] * hr[0]
+                ny += xi[0] * hi[0]
+                var xs = DSPDoubleSplitComplex(realp: xr, imagp: xi)
+                var hs = DSPDoubleSplitComplex(realp: hr, imagp: hi)
+                vDSP_zvmaD(&xs, 1, &hs, 1, &acc, 1, &accOut, 1, vDSP_Length(H))
+            }
+            slot = slot == 0 ? P - 1 : slot - 1
+        }
+        accRe[0] = dc
+        accIm[0] = ny
+        vDSP_fft_zripD(setup, &acc, 1, log2n, FFTDirection(kFFTDirection_Inverse))
+        time.withMemoryRebound(to: DSPDoubleComplex.self, capacity: H) {
+            vDSP_ztocD(&acc, 1, $0, 2, vDSP_Length(H))
+        }
+        // Overlap-save: the last B samples are the valid linear-convolution output.
+        dst.update(from: time + B, count: B)
+    }
+
+    /// Release a finished crossfade batch and pick up newly requested swaps (never blocks).
+    @inline(__always)
+    private func updateSwaps() {
+        guard fadeDone || fadeCount == 0, os_unfair_lock_trylock(swapLock) else { return }
+        if fadeDone {
+            for i in 0..<fadeCount { swapState[fadeList[i]] = 0 }
+            fadeCount = 0
+            fadeDone = false
+        }
+        for s in 0..<sourceCount where swapState[s] == 1 {
+            swapState[s] = 2
+            fadeList[fadeCount] = s
+            fadeCount += 1
+        }
+        fadeStep = 0
+        os_unfair_lock_unlock(swapLock)
+    }
+
     private func processBlock() {
-        let P = partitions, H = half, B = blockSize, S = sourceCount, W = 2 * B
+        let B = blockSize, S = sourceCount, W = 2 * B, P = partitions, H = half
         for s in 0..<S {
             forward(srcIn + s * W, re: xRe + (s * P + fdlPos) * H, im: xIm + (s * P + fdlPos) * H)
         }
+        updateSwaps()
+        let fading = fadeCount > 0 && !fadeDone
         for o in 0..<2 {
-            vDSP_vclrD(accRe, 1, vDSP_Length(H))
-            vDSP_vclrD(accIm, 1, vDSP_Length(H))
-            var acc = DSPDoubleSplitComplex(realp: accRe, imagp: accIm)
-            var accOut = acc
-            var dc = 0.0, ny = 0.0
-            var slot = fdlPos
-            for p in 0..<P {
-                for s in 0..<S {
-                    let xr = xRe + (s * P + slot) * H, xi = xIm + (s * P + slot) * H
-                    let k = (s * 2 + o) * P + p
-                    let hr = hRe + k * H, hi = hIm + k * H
-                    // Packed bin 0 holds DC (real) and Nyquist (imag) — both purely real products.
-                    dc += xr[0] * hr[0]
-                    ny += xi[0] * hi[0]
-                    var xs = DSPDoubleSplitComplex(realp: xr, imagp: xi)
-                    var hs = DSPDoubleSplitComplex(realp: hr, imagp: hi)
-                    vDSP_zvmaD(&xs, 1, &hs, 1, &acc, 1, &accOut, 1, vDSP_Length(H))
-                }
-                slot = slot == 0 ? P - 1 : slot - 1
+            let dst = o == 0 ? outL : outR
+            convolve(ear: o, list: allSources, count: S, otherSlot: false, into: dst)
+            if fading {
+                // out = all sources (old filters) + w · (fading sources' new − old), w rising linearly to 1.
+                convolve(ear: o, list: fadeList, count: fadeCount, otherSlot: false, into: fadeOld)
+                convolve(ear: o, list: fadeList, count: fadeCount, otherSlot: true, into: fadeNew)
+                let total = Double(fadeBlocks * B), base = Double(fadeStep * B)
+                for j in 0..<B { dst[j] += (fadeNew[j] - fadeOld[j]) * ((base + Double(j + 1)) / total) }
             }
-            accRe[0] = dc
-            accIm[0] = ny
-            vDSP_fft_zripD(setup, &acc, 1, log2n, FFTDirection(kFFTDirection_Inverse))
-            time.withMemoryRebound(to: DSPDoubleComplex.self, capacity: H) {
-                vDSP_ztocD(&acc, 1, $0, 2, vDSP_Length(H))
+        }
+        if fading {
+            fadeStep += 1
+            if fadeStep == fadeBlocks {
+                for i in 0..<fadeCount { activeSlot[fadeList[i]] ^= 1 }
+                fadeDone = true
             }
-            // Overlap-save: the last B samples are the valid linear-convolution output.
-            (o == 0 ? outL : outR).update(from: time + B, count: B)
         }
         for s in 0..<S { (srcIn + s * W).update(from: srcIn + s * W + B, count: B) }
         dryL.update(from: dryL + B, count: B)

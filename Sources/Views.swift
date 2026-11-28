@@ -63,6 +63,8 @@ struct MainView: View {
                 Text("Impulse response (drop a true-stereo, HeSuVi 14-channel or ASH 16-channel WAV, or a folder of ASH directional BRIRs)")
             }
 
+            HeadTrackingSection()
+
             Section("Input") {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -390,5 +392,133 @@ struct MenuContent: View {
             NSApp.activate(ignoringOtherApps: true)
         }
         Button("Quit") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+}
+
+/// Webcam head tracking (directional BRIR folders only). Observes the controller itself so its 20 Hz updates
+/// redraw only this section.
+struct HeadTrackingSection: View {
+    @ObservedObject var ht = HeadTrackingController.shared
+
+    var body: some View {
+        Section("Head tracking") {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle("Head tracking (webcam)", isOn: Binding(get: { ht.enabled }, set: { ht.setEnabled($0) }))
+                        .disabled(!ht.available && !ht.enabled)
+                    Text(caption).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if ht.enabled {
+                    Button("Recalibrate…") { ht.beginCalibration() }
+                }
+            }
+            if ht.enabled {
+                HStack {
+                    Picker("Camera", selection: $ht.cameraID) {
+                        Text("Default camera").tag("")
+                        ForEach(ht.cameras) { Text($0.name).tag($0.id) }
+                    }
+                    Button("Refresh") { ht.refreshCameras() }.controlSize(.small)
+                }
+                HStack(spacing: 8) {
+                    Circle().fill(!ht.cameraRunning ? Color.gray : ht.faceVisible ? .green : .orange).frame(width: 9, height: 9)
+                    Text(status)
+                    Spacer()
+                    if ht.cameraRunning {
+                        Text(String(format: "Head: %@, %@", Self.yawText(ht.pose.yaw), Self.pitchText(ht.pose.pitch)))
+                            .monospacedDigit().foregroundStyle(.secondary)
+                    }
+                }
+                if !ht.trackedSummary.isEmpty {
+                    Text(ht.trackedSummary).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
+            if let m = ht.message {
+                Text(m).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            }
+        }
+        .sheet(isPresented: Binding(get: { ht.calibrationVisible }, set: { if !$0 { ht.cancelCalibration() } })) {
+            CalibrationSheet()
+        }
+    }
+
+    private var caption: String {
+        if !ht.available {
+            return "Available with a folder of ASH Toolset directional BRIRs. Uses Apple's Vision face tracking with a "
+                + "webcam; camera access is asked for only when you turn this on."
+        }
+        if ht.enabled && !ht.attached { return "On. Tracking starts while convolution is running." }
+        return "Each speaker stays put in the room as you turn: it uses the exported direction nearest to where it is "
+            + "relative to your head."
+    }
+
+    private var status: String {
+        if !ht.cameraRunning { return ht.calibration == nil ? "Not calibrated" : "Camera off" }
+        if ht.faceVisible { return "Tracking" }
+        return "No face in view (holding the last position, then easing back to front)"
+    }
+
+    static func yawText(_ y: Double) -> String {
+        abs(y) < 0.5 ? "facing forward" : String(format: "turned %.0f° %@", abs(y), y < 0 ? "left" : "right")
+    }
+    static func pitchText(_ p: Double) -> String {
+        abs(p) < 0.5 ? "level" : String(format: "%.0f° %@", abs(p), p > 0 ? "up" : "down")
+    }
+}
+
+/// The five-step calibration: forward, then 45° left, right, up and down.
+struct CalibrationSheet: View {
+    @ObservedObject var ht = HeadTrackingController.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Head tracking calibration").font(.title2.weight(.semibold))
+            switch ht.calibrationPhase {
+            case .ready:
+                Text("Sit where you normally listen. You'll be asked to look straight ahead, then turn your head 45° left, "
+                     + "45° right, and tilt it 45° up and 45° down. Each position gets a 3-second countdown; then hold "
+                     + "still until you hear a chime, which means it's time for the next one.")
+                    .fixedSize(horizontal: false, vertical: true)
+            case .countdown, .capturing:
+                Text("Step \(ht.calibrationStep + 1) of \(CalibrationStep.allCases.count)").font(.caption).foregroundStyle(.secondary)
+                Text(ht.currentStep.instruction).font(.title3)
+                Text(ht.calibrationPhase == .countdown ? "\(ht.countdown)" : "Hold still…")
+                    .font(.system(size: 40, weight: .light)).monospacedDigit()
+            case .failed:
+                Text(ht.calibrationProblem ?? "Calibration failed.").foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            case .done:
+                Text("Calibrated. Turn your head and the speakers should stay where they are in the room. "
+                     + "Recalibrate any time from the Head tracking section.")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                Circle().fill(ht.faceVisible ? Color.green : .orange).frame(width: 9, height: 9)
+                if let r = ht.raw {
+                    Text(String(format: "Face seen — Vision reports yaw %+.1f°, pitch %+.1f°", r.yaw, r.pitch)).monospacedDigit()
+                } else {
+                    Text(ht.cameraRunning ? "No face in view" : "Starting the camera…")
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Cancel") { ht.cancelCalibration() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                switch ht.calibrationPhase {
+                case .ready:
+                    Button("Start") { ht.startCalibration() }.keyboardShortcut(.defaultAction)
+                case .failed:
+                    Button("Try again") { ht.retryCalibration() }.keyboardShortcut(.defaultAction)
+                case .done:
+                    Button("Done") { ht.finishCalibration() }.keyboardShortcut(.defaultAction)
+                case .countdown, .capturing:
+                    EmptyView()
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
     }
 }

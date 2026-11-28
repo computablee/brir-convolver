@@ -135,6 +135,30 @@ Dolby Atmos reaches the convolver as the 7.1.4 bed the playing app renders; indi
 to other apps. Whether an app renders heights at all varies (Apple's apps have been inconsistent about using more
 than 5.1).
 
+### Head tracking (webcam)
+
+With a directional folder loaded, turn on *Head tracking (webcam)* to keep the virtual speakers fixed in the room as
+you turn your head. It's off by default, and the camera permission prompt appears only the first time you turn it on.
+If access is later lost (for example after rebuilding the app, which changes its ad-hoc signature), the app turns
+head tracking off at launch and tells you; it never prompts at launch.
+
+- **Tracking** uses Apple's frameworks only: AVFoundation captures from the camera you pick, and Vision's face
+  detection (`VNDetectFaceRectanglesRequest`, revision 3) reports the face's yaw and pitch about 20 times a second.
+  Head tilt (roll) is ignored. The app does no image processing of its own, and video is never stored.
+- **Calibration** runs the first time and whenever you pick another camera, or on demand with *Recalibrate…*: look
+  straight ahead, then turn 45° left, 45° right, and tilt 45° up and 45° down. Each step has a 3-second countdown,
+  then about a second of capture that ends with a chime. Vision's readings are mapped piecewise-linearly through these
+  five points, so its sign conventions and the camera's position don't matter.
+- **Mapping:** each speaker's position is rotated opposite to your head (yaw, then pitch) and snapped to the nearest
+  exported direction, with 2° of hysteresis so a head held on a boundary doesn't flip between files. With your head
+  turned 90° left, the side-left speaker plays the A0° BRIR. The finer the folder's spatial resolution, the smoother
+  the movement.
+- **Switching** is click-free. The new BRIR is loaded off the audio thread (resampled if the folder's rate differs
+  from the device's) and crossfaded over about 20 ms on the same input. After the fade the output is exactly the input
+  convolved with the new BRIR. Recently used directions are cached.
+- **Limits:** a webcam loses your face somewhere past about 60–75° of yaw. When it does, the last position is held for
+  2 s and then eases back to the front. The surround test plays with the speakers facing forward.
+
 ### Surround test
 
 *Surround test → Play from each speaker* plays a stock macOS sound (pick it from the list) from each virtual

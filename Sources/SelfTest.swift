@@ -35,6 +35,7 @@ enum SelfTest {
         testRoutingRules()
         testDirectionalFolder()
         testHeightRouting()
+        testHeadTrackingMath()
 
         // ---------- Accuracy: stereo routing on the loaded/synthetic set, 7.1 routing on a synthetic set ----------
         let stereo = Routing.make(brir: set, roles: Routing.defaultRoles(count: 2), lfeGain: 1)
@@ -50,6 +51,7 @@ enum SelfTest {
         testSurroundTestPlayback(routing: stereo, rate: set.sampleRate)
         testChannelActivity(routing: surround, rate: surroundSet.sampleRate)
         testSolo(routing: surround, rate: surroundSet.sampleRate)
+        testIRSwap()
         testSurroundTestRender()
 
         // ---------- Performance ----------
@@ -434,6 +436,98 @@ enum SelfTest {
         let metersSeeAll = (0..<8).allSatisfy { a.inputPeaks[$0] > 0.2 }
         report(maxErr < 1e-6 && metersSeeAll,
                String(format: "solo channel %d = that channel alone (max difference %.1e); meters still see all 8", ch + 1, maxErr))
+    }
+
+    /// Calibration mapping, head rotation, and nearest-direction choice with hysteresis.
+    static func testHeadTrackingMath() {
+        func near(_ a: Double, _ b: Double) -> Bool { abs(a - b) < 1e-9 }
+        // A made-up camera whose yaw is positive to the left, offset, and asymmetric.
+        let cal = HeadCalibration(cameraID: "", forward: RawPose(yaw: 2, pitch: -3), left: RawPose(yaw: 32, pitch: -3),
+                                  right: RawPose(yaw: -25, pitch: -3), up: RawPose(yaw: 2, pitch: 20),
+                                  down: RawPose(yaw: 2, pitch: -30))
+        let m = [cal.pose(cal.forward), cal.pose(cal.left), cal.pose(cal.right), cal.pose(cal.up), cal.pose(cal.down),
+                 cal.pose(RawPose(yaw: 17, pitch: -3)), cal.pose(RawPose(yaw: 47, pitch: -3))]
+        let calOK = cal.problem == nil && near(m[0].yaw, 0) && near(m[0].pitch, 0) && near(m[1].yaw, -45) && near(m[2].yaw, 45)
+            && near(m[3].pitch, 45) && near(m[4].pitch, -45) && near(m[5].yaw, -22.5) && near(m[6].yaw, -67.5)
+        var flat = cal; flat.left = RawPose(yaw: 4, pitch: -3)
+        var sameSide = cal; sameSide.right = RawPose(yaw: 20, pitch: -3)
+        report(calOK && flat.problem != nil && sameSide.problem != nil,
+               "head calibration maps forward/45° points exactly, interpolates and extrapolates, and rejects bad readings")
+
+        func rel(_ e: Int, _ a: Int, yaw: Double, pitch: Double) -> (Double, Double) {
+            let r = HeadRotation.relative(Direction(elevation: e, azimuth: a), head: HeadPose(yaw: yaw, pitch: pitch))
+            return (r.elevation, r.azimuth)
+        }
+        func close(_ r: (Double, Double), _ e: Double, _ a: Double) -> Bool { abs(r.0 - e) < 1e-6 && abs(r.1 - a) < 1e-6 }
+        let rotOK = close(rel(0, -90, yaw: -90, pitch: 0), 0, 0)      // head 90° left: side left is straight ahead
+            && close(rel(0, -30, yaw: -90, pitch: 0), 0, 60)          // … and front left is 60° to the right
+            && close(rel(0, 30, yaw: 45, pitch: 0), 0, -15)
+            && close(rel(45, 0, yaw: 0, pitch: 45), 0, 0)             // looking up 45°: a 45° high speaker is ahead
+            && close(rel(0, 0, yaw: 0, pitch: 45), -45, 0)            // … and the centre is 45° below
+        report(rotOK, "head rotation: speakers stay fixed in the room (yaw, then pitch)")
+
+        let grid = stride(from: -180, to: 180, by: 15).map { Direction(elevation: 0, azimuth: $0) }
+            + [Direction(elevation: 30, azimuth: 0)]
+        let idx = DirectionIndex(grid)
+        let a0 = Direction(elevation: 0, azimuth: 0), a15 = Direction(elevation: 0, azimuth: 15)
+        let nearOK = idx.nearest(elevation: 0, azimuth: 7, current: nil, hysteresis: 2) == a0
+            && idx.nearest(elevation: 0, azimuth: 8.5, current: a0, hysteresis: 2) == a0     // 6.5° vs 8.5°: stays
+            && idx.nearest(elevation: 0, azimuth: 9.5, current: a0, hysteresis: 2) == a15    // 5.5° vs 9.5°: moves
+            && idx.nearest(elevation: 0, azimuth: 8.5, current: nil, hysteresis: 2) == a15
+            && idx.nearest(elevation: 0, azimuth: 179, current: nil, hysteresis: 0) == Direction(elevation: 0, azimuth: -180)
+            && idx.nearest(elevation: 25, azimuth: 2, current: a0, hysteresis: 2) == Direction(elevation: 30, azimuth: 0)
+        report(nearOK, "nearest exported direction, with hysteresis at boundaries and wrap-around at ±180°")
+    }
+
+    /// Swapping BRIRs live (head tracking): during the crossfade every sample lies between the old and new
+    /// outputs, and afterwards the output is exactly the input convolved with the new BRIRs.
+    static func testIRSwap() {
+        let B = 128, rate = 48000.0, half = 30_000, total = 2 * half
+        let set = syntheticSet(speakers: [.FL, .FR, .BL, .BR], length: 3000)
+        let routing = Routing.make(brir: set, roles: Routing.defaultRoles(count: 2), lfeGain: 1)   // sources FL, FR
+        let conv = Convolver(routing: routing, sampleRate: rate, blockSize: B, gainDB: 0, bypass: false, ceiling: .infinity)
+        let x = noise(channels: 2, count: total, active: total, amp: 0.3)
+        let (l1, r1) = run(conv, x.map { Array($0[0..<half]) })
+        let newIR = [set.ir(.BL)!, set.ir(.BR)!]
+        let first = conv.swapIR(source: 0, left: newIR[0].left, right: newIR[0].right)
+        let again = conv.swapIR(source: 0, left: newIR[0].left, right: newIR[0].right)   // still pending: refused
+        let second = conv.swapIR(source: 1, left: newIR[1].left, right: newIR[1].right)
+        let (l2, r2) = run(conv, x.map { Array($0[half...]) })
+        let yl = l1 + l2, yr = r1 + r2
+
+        // Direct references, delayed by B: y[n + B] = Σ_s Σ_k x_s[k] h_s[n − k].
+        func ref(_ n: Int, ear o: Int, new: Bool) -> Double {
+            var acc = 0.0
+            for (s, src) in routing.sources.enumerated() {
+                let ir = new ? newIR[s] : SpeakerIR(speaker: src.speaker, left: src.left, right: src.right)
+                let h = o == 0 ? ir.left : ir.right
+                let ch = src.inputs[0].channel
+                for k in max(0, n - h.count + 1)...n { acc += Double(x[ch][k]) * h[n - k] }
+            }
+            return acc
+        }
+        // The swap is picked up at the first block boundary after `half`, then fades for `fadeBlocks` blocks.
+        let pickup = ((half + B - 1) / B) * B
+        let fadeEnd = pickup + conv.fadeBlocks * B
+        var maxErr = 0.0, maxRef = 0.0, outside = 0.0
+        for n in stride(from: pickup - 4 * B, to: total - B, by: 5) {
+            for o in 0..<2 {
+                let got = Double((o == 0 ? yl : yr)[n + B])
+                let old = ref(n, ear: o, new: false), new = ref(n, ear: o, new: true)
+                maxRef = max(maxRef, abs(old), abs(new))
+                if n + B < pickup {
+                    maxErr = max(maxErr, abs(got - old))
+                } else if n + B >= fadeEnd {
+                    maxErr = max(maxErr, abs(got - new))
+                } else {
+                    outside = max(outside, min(old, new) - got, got - max(old, new))
+                }
+            }
+        }
+        let errDB = 20 * log10(max(maxErr, 1e-300) / maxRef)
+        report(first && !again && second && !conv.swapsPending && errDB < -130 && outside < 1e-6,
+               String(format: "live BRIR swap: exact before and after the %d-block crossfade (max error %.1f dB re peak); "
+                      + "the fade stays between the old and new outputs (overshoot %.1e)", conv.fadeBlocks, errDB, max(0, outside)))
     }
 
     static func testSurroundTestRender() {

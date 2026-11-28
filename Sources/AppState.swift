@@ -138,6 +138,9 @@ final class AppState: ObservableObject {
     }
 
     private var sourceIR: BRIRSet?
+    /// The loaded directional folder (head tracking swaps BRIRs from it).
+    private var directionalFolder: DirectionalFolder?
+    private var headTracking: HeadTrackingController { .shared }
     private var irCache: [Double: BRIRSet] = [:]
     private var pipeline: AudioPipeline?
     private var currentExclusions: Set<AudioObjectID> = []
@@ -191,16 +194,20 @@ final class AppState: ObservableObject {
             let ir: BRIRSet
             var wav: WAVFile?
             if DirectionalFolder.isDirectional(url) {
-                ir = try BRIRSet(folder: try DirectionalFolder(url: url), positions: speakerPositions)
+                let folder = try DirectionalFolder(url: url)
+                ir = try BRIRSet(folder: folder, positions: speakerPositions)
+                directionalFolder = folder
                 isDirectionalFolder = true
                 irChannels = 0
             } else {
                 let w = try WAVFile(url: url)
                 ir = try BRIRSet(wav: w, order: channelOrder, mapping: multichannelMapping)
                 wav = w
+                directionalFolder = nil
                 isDirectionalFolder = false
                 irChannels = w.channelCount
             }
+            headTracking.setAvailable(isDirectionalFolder)
             chosenDirections = ir.chosen
             sourceIR = ir
             irCache = [ir.sampleRate: ir]
@@ -221,6 +228,8 @@ final class AppState: ObservableObject {
             irChannels = 0
             availablePairs = []
             isDirectionalFolder = false
+            directionalFolder = nil
+            headTracking.setAvailable(false)
             chosenDirections = []
             irInfo = "No BRIR loaded"
             stop(keepEnabled: true)
@@ -714,6 +723,9 @@ final class AppState: ObservableObject {
             receivingSummary = ""
             try p.start(convolver: conv)
             pipeline = p
+            if let folder = directionalFolder {
+                headTracking.attach(convolver: conv, folder: folder, directions: ir.directions, positions: speakerPositions)
+            }
             firTaps = ir.length
             firRate = rate
             currentExclusions = excl.ids
@@ -753,6 +765,7 @@ final class AppState: ObservableObject {
 
     func stop(keepEnabled: Bool = false) {
         if pipeline != nil { Log.pipeline.notice("stop") }
+        headTracking.detach()
         pipeline?.stop()
         pipeline = nil
         if let l = rateListener, observedDevice != 0 {
