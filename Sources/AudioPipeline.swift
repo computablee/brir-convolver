@@ -6,7 +6,9 @@ import Foundation
 /// via a Core Audio process tap (stereo, originals muted) or a multichannel input device such as a loopback
 /// driver set as the macOS output. Capture + output live in one private aggregate device, so a single IOProc
 /// reads the input and writes the output on the same clock.
-final class AudioPipeline {
+/// `@unchecked Sendable`: `prepare` runs on AppState's pipeline queue, then the pipeline is handed to the main
+/// thread and used only there (the realtime side goes through `RenderContext`).
+final class AudioPipeline: @unchecked Sendable {
     static let aggregateUIDPrefix = "com.phil.brirconvolver.aggregate"
 
     struct Config {
@@ -113,7 +115,13 @@ final class AudioPipeline {
                 Thread.sleep(forTimeInterval: 0.2)
             }
             try check(lastStatus, "Creating system audio tap")
-            guard let fmt = format else { throw CAError(what: "Reading tap format", status: -1) }
+            guard let fmt = format else {
+                throw PipelineError("Core Audio created the system audio tap but wouldn't report its format, so there's "
+                    + "nothing to capture. This usually means macOS isn't letting BRIR Convolver record system audio: check "
+                    + "System Settings → Privacy & Security → Screen & System Audio Recording (the System Audio Recording "
+                    + "Only list). Rebuilding the app can reset this permission; if it's listed, remove it and turn "
+                    + "convolution off and on to be asked again.")
+            }
             tapID = tap
             inputChannels = max(1, Int(fmt.mChannelsPerFrame))
             fallbackRate = fmt.mSampleRate

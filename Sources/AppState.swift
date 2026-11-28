@@ -149,6 +149,10 @@ final class AppState: ObservableObject {
     private var restartWork: DispatchWorkItem?
     private var meterTimer: Timer?
     private var restarting = false
+    /// Bumped by every stop (and so every start): a capture path still being prepared for an older one is discarded.
+    private var startGeneration = 0
+    /// Where capture paths are prepared (Core Audio calls that can block), one at a time.
+    private let pipelineQueue = DispatchQueue(label: "com.phil.brirconvolver.pipeline", qos: .userInitiated)
     /// Consecutive failed starts, for retry back-off (reset on success).
     private var failedStarts = 0
 
@@ -711,9 +715,29 @@ final class AppState: ObservableObject {
         }
         let excl = usingSystemTap ? computeExclusions() : (ids: Set<AudioObjectID>(), names: [String]())
         let p = AudioPipeline()
+        let config = AudioPipeline.Config(outputUID: uid, inputUID: effectiveInputUID,
+                                          excludedProcesses: Array(excl.ids), driftCompensation: driftCompensation)
+        // Creating the tap and aggregate can take seconds when Core Audio is unhappy (the tap is retried in place),
+        // so it runs off the main thread; the UI stays responsive and a newer start or stop supersedes it.
+        let generation = startGeneration
+        status = "Starting…"
+        pipelineQueue.async {
+            let result = Result { try p.prepare(config) }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { AppState.shared.finishStart(generation, p, result, device: dev, exclusions: excl) }
+            }
+        }
+    }
+
+    /// Second half of `start()`, back on the main thread once the capture path exists.
+    private func finishStart(_ generation: Int, _ p: AudioPipeline, _ prepared: Result<Double, Error>, device dev: AudioObjectID,
+                             exclusions excl: (ids: Set<AudioObjectID>, names: [String])) {
+        guard generation == startGeneration, enabled else {
+            p.stop()   // superseded by a later start or stop
+            return
+        }
         do {
-            let rate = try p.prepare(.init(outputUID: uid, inputUID: effectiveInputUID,
-                                           excludedProcesses: Array(excl.ids), driftCompensation: driftCompensation))
+            let rate = try prepared.get()
             guard let ir = ir(at: rate) else { p.stop(); return }
             let roles = inputRoles(channels: p.inputChannels)
             let routing = Routing.make(brir: ir, roles: roles, lfeGain: lfeGainDB.map { pow(10, $0 / 20) } ?? 0)
@@ -761,7 +785,7 @@ final class AppState: ObservableObject {
             status = String(format: "Error — retrying in %.0f s", delay)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 Task { @MainActor in
-                    guard let self, self.enabled, !self.running else { return }
+                    guard let self, self.enabled, !self.running, generation == self.startGeneration else { return }
                     self.scheduleRestart("retry after a failed start (attempt \(self.failedStarts + 1))")
                 }
             }
@@ -769,6 +793,7 @@ final class AppState: ObservableObject {
     }
 
     func stop(keepEnabled: Bool = false) {
+        startGeneration += 1
         if pipeline != nil { Log.pipeline.notice("stop") }
         headTracking.detach()
         pipeline?.stop()
